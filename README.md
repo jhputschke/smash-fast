@@ -6,6 +6,8 @@ SMASH (Simulating Many Accelerated Strongly-interacting Hadrons) is a relativist
 Please see [Phys. Rev. C 94, 054905 (2016)](https://arxiv.org/abs/1606.06642) for details and, if you are using SMASH, cite this reference together with the [software DOI](https://doi.org/10.5281/zenodo.3484711) for the specific code version employed.
 A BibTeX entry for the software DOI is found on the respective Zenodo pages.
 
+> ⚡ **Looking to speed up SMASH?** See [README_FAST](README_FAST.md) for install/run instructions, per-setting speedups, and reproduction steps for this fast variant.
+
 See [CONTRIBUTING](CONTRIBUTING.md) for development hints.
 A complete [User Guide](https://theory.gsi.de/~smash/userguide/current/) as well as a more detailed [development documentation](http://theory.gsi.de/~smash/doc/current/) are available for the latest version of the code.
 For documentation of older versions, refer to links in the [releases pages](https://github.com/smash-transport/smash/releases).
