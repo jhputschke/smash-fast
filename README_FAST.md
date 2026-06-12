@@ -26,7 +26,7 @@ detail and transparency.
 | Area | What runs in parallel | Typical speedup | Reproducibility |
 |---|---|---|---|
 | **Ensembles** (no strings) | action *finding* + time‑stepless *performing* over independent ensembles | **3.3× (4t), 5.5–6.5× (8t)** | bit‑identical across thread counts |
-| **Strings** (Pythia) | per‑thread Pythia/`StringProcess`; ensemble find/perform with strings on | **~2× (8t)** | bit‑identical (moderate strings) / conserved to 1.7e‑10 (heavy strings) |
+| **Strings** (Pythia, Collider) | **still the ensemble loop** (per‑thread Pythia/`StringProcess`, static schedule) — *not* a separate parallel path | **~2× (8t)** — but only with `Ensembles > 1` **and** strings that actually fire (high √s); otherwise **slower** (see below) | bit‑identical (moderate strings) / conserved to 1.7e‑10 (heavy strings) |
 | **Single big event** (`Ensembles: 1`) | cell‑parallel pair search in action finding | **3.9× (8t)** | bit‑identical across thread counts |
 | **Mean‑field / potentials** | tabulated momentum‑dependent root‑find + node‑parallel *gather* density fill + node‑parallel force loops | **~2.4× (8t)** over the original momentum‑dependent baseline | validated by conservation (FP‑chaotic; see below) |
 | **GPU prototype** (box + stochastic) | propagation + stochastic 2→2 finding on a GPU | **1.4–2× on GB10** (memory‑bound) | reproduces CPU result *exactly* |
@@ -111,7 +111,8 @@ Pythia 8.316; "evolution time" excludes the one‑time serial cache warm‑up):
 |---|---|---|---|
 | **Many ensembles, `Strings: False`, no per‑interaction output** | parallel finding **and** performing | 3.3× (4t), 5.5–6.5× (8t) | the headline case; `input/box`, `verify/box_fast.yaml`, `verify/box_heavy.yaml` |
 | **Many ensembles, `Strings: False`, collision/dilepton/photon/IC output** | parallel finding only (performing serial to keep output ordered) | ~2.7× (4t) | `input/stochastic_box` (stochastic criterion → finding only) |
-| **`Strings: True`** | per‑thread Pythia; parallel find/perform with a static schedule | 1.35× (2t), ~2× (8t) | grows with #ensembles and string fraction; `verify/strings_collider.yaml`, `verify/strings_heavy.yaml` |
+| **`Strings: True`, `Ensembles` ≥ threads, high √s** (strings actually fire) | per‑thread Pythia; parallel find **and** perform, static schedule (find‑thread = perform‑thread) | 1.35× (2t), ~2× (8t) | the **only** strings‑on case that speeds up; grows with #ensembles and string fraction. `verify/strings_collider.yaml` (O+O, √sₙₙ=17.3 GeV, 4 ens), `verify/strings_heavy.yaml` (Au+Au, 8 ens) |
+| **`Strings: True`, `Ensembles: 1`** *or* **low‑energy Collider** (strings never fire) | nothing parallelizes — one ensemble = no work to split, yet `OMP_NUM_THREADS` Pythia instances are still built; the strings flag also **disables** the cell‑parallel finder | **< 1× (slower than 1 thread)** | the common trap, e.g. Au+Au at `E_Kin: 1.23` GeV. Fix: set `Strings: False` (physically identical at that energy) and/or raise `Ensembles` — see callout below |
 | **`Ensembles: 1`, `Strings: False`, non‑stochastic criterion** | cell‑parallel pair search | 1.65× (2t), 2.66× (4t), 3.9× (8t) | `verify/box_heavy.yaml` with 1 ensemble |
 | **`Potentials:` (mean field)** | tabulated root‑find (deterministic) + **gather density fill for ≥ 4 threads** + node‑parallel force loops | 1.13× (1t, tabulation only), 1.54× (4t), **2.43× (8t)** | `input/potentials`, `verify/potentials_nomd.yaml`, `verify/md_on/config.yaml` |
 
@@ -122,6 +123,40 @@ scatter is used, so single/low‑thread runs never regress. The momentum‑depen
 local‑rest‑frame potential is **pre‑tabulated** at construction (a 2‑D bilinear
 table), making each GSL root‑finder iteration a lookup — a deterministic ~1.11×
 on its own with no threading.
+
+### Strings on (Collider): when to expect a speedup
+
+There is **no separate "strings" parallelism** — with strings on, the parallel
+unit is *still the ensemble*. Each OpenMP thread gets its own
+Pythia/`StringProcess` and a **static** schedule pins one ensemble to one thread
+(so the thread that finds an ensemble's actions also performs them, and only it
+touches its own Pythia). A strings‑on run therefore speeds up **only when there
+are independent ensembles to hand to the threads**.
+
+Expect a speedup **only if all of these hold**:
+
+- **`Ensembles: N` with `N ≥ OMP_NUM_THREADS`.** This is the parallel unit. With
+  `Ensembles: 1` the loop has a single iteration — nothing to split — regardless
+  of thread count.
+- **Collision energy high enough that strings actually fire** (e.g. √sₙₙ ≳ a few
+  GeV; the verify configs use 17.3 GeV). The string fraction of the runtime is
+  what the threads divide up.
+- A **Release** build, and `OMP_NUM_THREADS ≤` physical cores (no
+  oversubscription).
+
+Expect it to be **slower than one thread** when:
+
+- **`Ensembles: 1` with `Strings: True`.** No parallel work, yet
+  `OMP_NUM_THREADS` Pythia instances are still constructed at start‑up
+  (≈ Pythia‑init seconds + tens of MB each), and the strings flag *disables* the
+  single‑event cell‑parallel finder ([experiment.h:2710](src/include/smash/experiment.h#L2710)).
+- A **low‑energy Collider** (e.g. Au+Au at `E_Kin: 1.23` GeV). Strings never fire
+  at that energy, so `Strings: True` only adds the per‑thread Pythia cost. Set
+  **`Strings: False`** — it is physically identical there *and* re‑enables the
+  cell‑parallel finder — and/or raise **`Ensembles`** to get the ensemble path.
+
+Rule of thumb for a low‑energy mean‑field Collider run (the typical use of this
+fork): use **`Strings: False` + `Ensembles ≥ OMP_NUM_THREADS`**.
 
 What does **not** speed up: configurations dominated by a serial bottleneck the
 parallel work doesn't touch — e.g. the box's per‑timestep conservation check
