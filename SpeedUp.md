@@ -254,6 +254,34 @@ gap. Parallelizing the conservation reduction is a clean follow-up.
 *Stochastic box (`input/stochastic_box`, collision output → parallel finding
 only), 4 ensembles:* 1.45× (2t), 2.66× (4t), all reproducible (`bc75609e…`).
 
+**Per-configuration matrix.** One case from each row of the feasibility table was
+run under OpenMP to confirm no configuration regressed and that results are
+reproducible across thread counts:
+
+| Configuration | Input | Threads | Result |
+|---|---|---|---|
+| Covariant, hadronic, no strings | `box` / `box_fast` | 1/2/4/8 | reproducible; 3.3–6.5× |
+| Stochastic criterion | `stochastic_box` | 1/2/4 | reproducible; 2.7× (finding) |
+| Sphere modus | `sphere` | 1/4 | reproducible (`8a0a80ff…`) |
+| + Mean-field potentials (Collider) | `potentials` | 1/4/8 | reproducible (`b13d927a…`), completes; speedup ~1× |
+| + Strings (high-energy Collider) | `config.yaml` | 4 | completes (serial fallback) |
+| Single big event | `box_heavy`, 1 ens | 1/2/4/8 | reproducible (Phase 3a, `1a2ac644…`) |
+
+**Mean-field note.** The potentials path is correct and reproducible but does not
+speed up: each time step is dominated by two *serial* steps — the lattice
+accumulation over all ensembles (`update_potentials`/
+`update_lattice_accumulating_ensembles`) and the momentum update
+(`update_momenta`). The wasteful all-ensemble particle-list copy in
+`update_momenta` is now skipped when the lattice is used and neither the
+momentum-dependent nor the outside-lattice force path is active (a pure
+optimization — output unchanged). The momentum-update loop itself was left
+*serial*: its potential-force evaluation (`Potentials::all_forces` /
+`single_particle_energy_gradient`) is not thread-safe (it aborts under threads),
+so a real mean-field speedup needs (a) a thread-safe force evaluation, (b) a
+parallel momentum loop, and (c) the per-thread partial-lattice reduction for
+`update_potentials`. That is the scoped mean-field follow-on; strings need the
+per-thread Pythia. Both are the high-risk items the plan deferred.
+
 The no-output covariant box parallelizes both finding and performing and scales
 near-linearly up to the number of ensembles; the collision-output stochastic box
 parallelizes finding only (performing kept serial for ordered output) and still
