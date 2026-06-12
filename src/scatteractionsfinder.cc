@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <map>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "smash/constants.h"
 #include "smash/decaymodes.h"
@@ -102,29 +105,82 @@ ScatterActionsFinder::ScatterActionsFinder(
   }
 
   if (finder_parameters_.strings_switch) {
-    string_process_interface_ = std::make_unique<StringProcess>(
-        config.take(InputKeys::collTerm_stringParam_stringTension),
-        string_formation_time_,
-        config.take(InputKeys::collTerm_stringParam_gluonBeta),
-        config.take(InputKeys::collTerm_stringParam_gluonPMin),
-        config.take(InputKeys::collTerm_stringParam_quarkAlpha),
-        config.take(InputKeys::collTerm_stringParam_quarkBeta),
-        config.take(InputKeys::collTerm_stringParam_strangeSuppression),
-        config.take(InputKeys::collTerm_stringParam_diquarkSuppression),
-        config.take(InputKeys::collTerm_stringParam_sigmaPerp),
-        config.take(InputKeys::collTerm_stringParam_stringZALeading),
-        config.take(InputKeys::collTerm_stringParam_stringZBLeading),
-        config.take(InputKeys::collTerm_stringParam_stringZA),
-        config.take(InputKeys::collTerm_stringParam_stringZB),
-        config.take(InputKeys::collTerm_stringParam_stringSigmaT),
-        config.take(InputKeys::collTerm_stringParam_formTimeFactor),
-        config.take(InputKeys::collTerm_stringParam_mDependentFormationTimes),
-        config.take(InputKeys::collTerm_stringParam_probabilityPToDUU),
-        config.take(InputKeys::collTerm_stringParam_separateFragmentBaryon),
-        config.take(InputKeys::collTerm_stringParam_popcornRate),
+    /* Take every string parameter from the configuration exactly once (take()
+     * consumes the key), then build one StringProcess per OpenMP thread with
+     * those identical parameters. Each thread owns its own Pythia so the
+     * ensemble loop is thread-safe with strings on (Phase 2 strings). */
+    const auto string_tension =
+        config.take(InputKeys::collTerm_stringParam_stringTension);
+    const auto gluon_beta =
+        config.take(InputKeys::collTerm_stringParam_gluonBeta);
+    const auto gluon_pmin =
+        config.take(InputKeys::collTerm_stringParam_gluonPMin);
+    const auto quark_alpha =
+        config.take(InputKeys::collTerm_stringParam_quarkAlpha);
+    const auto quark_beta =
+        config.take(InputKeys::collTerm_stringParam_quarkBeta);
+    const auto strange_supp =
+        config.take(InputKeys::collTerm_stringParam_strangeSuppression);
+    const auto diquark_supp =
+        config.take(InputKeys::collTerm_stringParam_diquarkSuppression);
+    const auto sigma_perp =
+        config.take(InputKeys::collTerm_stringParam_sigmaPerp);
+    const auto stringz_a_leading =
+        config.take(InputKeys::collTerm_stringParam_stringZALeading);
+    const auto stringz_b_leading =
+        config.take(InputKeys::collTerm_stringParam_stringZBLeading);
+    const auto stringz_a = config.take(InputKeys::collTerm_stringParam_stringZA);
+    const auto stringz_b = config.take(InputKeys::collTerm_stringParam_stringZB);
+    const auto string_sigma_t =
+        config.take(InputKeys::collTerm_stringParam_stringSigmaT);
+    const auto form_time_factor =
+        config.take(InputKeys::collTerm_stringParam_formTimeFactor);
+    const auto m_dependent_formation =
+        config.take(InputKeys::collTerm_stringParam_mDependentFormationTimes);
+    const auto prob_p_to_duu =
+        config.take(InputKeys::collTerm_stringParam_probabilityPToDUU);
+    const auto separate_fragment_baryon =
+        config.take(InputKeys::collTerm_stringParam_separateFragmentBaryon);
+    const auto popcorn_rate =
+        config.take(InputKeys::collTerm_stringParam_popcornRate);
+    const auto use_monash =
         config.take(InputKeys::collTerm_stringParam_useMonashTune,
-                    parameters.use_monash_tune_default.value()));
+                    parameters.use_monash_tune_default.value());
+    int n_string_processes = 1;
+#ifdef _OPENMP
+    n_string_processes = omp_get_max_threads();
+#endif
+    for (int t = 0; t < n_string_processes; ++t) {
+      string_processes_.push_back(std::make_unique<StringProcess>(
+          string_tension, string_formation_time_, gluon_beta, gluon_pmin,
+          quark_alpha, quark_beta, strange_supp, diquark_supp, sigma_perp,
+          stringz_a_leading, stringz_b_leading, stringz_a, stringz_b,
+          string_sigma_t, form_time_factor, m_dependent_formation, prob_p_to_duu,
+          separate_fragment_baryon, popcorn_rate, use_monash));
+    }
   }
+}
+
+StringProcess* ScatterActionsFinder::string_process_for_thread() const {
+  if (string_processes_.empty()) {
+    return nullptr;
+  }
+  int t = 0;
+#ifdef _OPENMP
+  t = omp_get_thread_num();
+#endif
+  return string_processes_[t].get();
+}
+
+void ScatterActionsFinder::reseed_string_process() const {
+  if (string_processes_.empty()) {
+    return;
+  }
+  int t = 0;
+#ifdef _OPENMP
+  t = omp_get_thread_num();
+#endif
+  string_processes_[t]->init_pythia_hadron_rndm();
 }
 
 static StringTransitionParameters create_string_transition_parameters(
@@ -273,7 +329,7 @@ ActionPtr ScatterActionsFinder::check_collision_two_part(
   }
 
   if (finder_parameters_.strings_switch) {
-    act->set_string_interface(string_process_interface_.get());
+    act->set_string_interface(string_process_for_thread());
   }
 
   // Distance squared calculation not needed for stochastic criterion
@@ -593,7 +649,7 @@ void ScatterActionsFinder::dump_reactions() const {
                 A, B, time, isotropic_, string_formation_time_, -1, false,
                 finder_parameters_.spin_interaction_type);
             if (finder_parameters_.strings_switch) {
-              act->set_string_interface(string_process_interface_.get());
+              act->set_string_interface(string_process_for_thread());
             }
             act->add_all_scatterings(finder_parameters_);
             const double total_cs = act->cross_section();
@@ -978,7 +1034,7 @@ void ScatterActionsFinder::dump_cross_sections(
         a_data, b_data, 0., isotropic_, string_formation_time_, -1, false,
         finder_parameters_.spin_interaction_type);
     if (finder_parameters_.strings_switch) {
-      act->set_string_interface(string_process_interface_.get());
+      act->set_string_interface(string_process_for_thread());
     }
     act->add_all_scatterings(finder_parameters_);
     decaytree::Node tree(a.name() + b.name(), act->cross_section(), {&a, &b},

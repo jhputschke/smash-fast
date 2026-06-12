@@ -14,6 +14,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "actionfinderfactory.h"
 #include "actions.h"
@@ -2673,27 +2676,39 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
         "Experiment cannot evolve the system beyond End_Time.");
   }
   /* Phase 2 parallelization gates (constant across the run):
-   *  - action *finding* over ensembles is parallelized whenever strings are
-   *    off (with strings the single shared Pythia/StringProcess inside the
-   *    finder is not thread-safe);
-   *  - action *performing* is additionally only parallelized when no output is
-   *    written per interaction, so that such output stays deterministically
-   *    ordered. When kept serial the loop still runs correctly, just on one
-   *    thread. The flags are unused without OpenMP (the pragmas are no-ops).
+   *  - action *finding* and *performing* over ensembles are now parallelized
+   *    even with strings on: each thread owns its own StringProcess/Pythia
+   *    (Phase 2 strings), and the per-ensemble Pythia reseeding keeps results
+   *    reproducible. With strings on the ensemble loops use a *static* schedule
+   *    (set below) so that the thread which finds an ensemble's actions is the
+   *    one that performs them, hence the only thread touching that thread's
+   *    Pythia;
+   *  - action *performing* is only parallelized when no output is written per
+   *    interaction, so such output stays deterministically ordered. When kept
+   *    serial the loop still runs correctly, just on one thread. The flags are
+   *    unused without OpenMP (the pragmas are no-ops).
    */
-  [[maybe_unused]] const bool parallel_find = !parameters_.strings_switch;
-  [[maybe_unused]] const bool parallel_perform =
-      parallel_find && !has_per_interaction_output_;
+  [[maybe_unused]] const bool parallel_find = true;
+  [[maybe_unused]] const bool parallel_perform = !has_per_interaction_output_;
+#ifdef _OPENMP
+  /* Strings: pin ensembles to threads (static) so find-thread == perform-thread.
+   * No strings: dynamic schedule for better load balancing. Applies to the
+   * ensemble find/perform loops, which use schedule(runtime). */
+  omp_set_schedule(
+      parameters_.strings_switch ? omp_sched_static : omp_sched_dynamic, 0);
+#endif
   /* Phase 3a: for a single big event the ensemble loop offers no parallelism,
    * so instead distribute the (expensive) per-cell pair search over threads.
-   * Restricted to the geometric/covariant criteria; the per-cell results are
-   * merged in serial order and each task is given a deterministic RNG seed (for
-   * the decay-time sampling), so the result is bit-reproducible for any thread
-   * count. The stochastic criterion draws a random number per particle *pair*
-   * during finding and would need a counter-based RNG keyed by the pair to stay
-   * reproducible (a documented follow-on), so it keeps the serial cell search. */
+   * Restricted to the geometric/covariant criteria without strings (the
+   * per-thread Pythia is keyed to the ensemble loop, not the cell loop); the
+   * per-cell results are merged in serial order and each task is given a
+   * deterministic RNG seed (for the decay-time sampling), so the result is
+   * bit-reproducible for any thread count. The stochastic criterion draws a
+   * random number per particle *pair* during finding and would need a
+   * counter-based RNG keyed by the pair to stay reproducible (a documented
+   * follow-on), so it keeps the serial cell search. */
   [[maybe_unused]] const bool cell_parallel_find =
-      parallel_find && parameters_.n_ensembles == 1 &&
+      parameters_.n_ensembles == 1 && !parameters_.strings_switch &&
       parameters_.coll_crit != CollisionCriterion::Stochastic;
   while (*(parameters_.labclock) < t_end) {
     const double dt = parameters_.labclock->timestep_duration();
@@ -2731,7 +2746,7 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
      * uneven particle counts. When the cell-parallel path (Phase 3a) is taken
      * the outer loop is kept serial (one ensemble) and the parallelism is moved
      * inside, onto the grid cells, to avoid nested parallel regions. */
-#pragma omp parallel for schedule(dynamic) if (parallel_find && !cell_parallel_find)
+#pragma omp parallel for schedule(runtime) if (parallel_find && !cell_parallel_find)
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
       random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
       actions[i_ens].clear();
@@ -2783,7 +2798,7 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
      * (intermediate_output, reporting) reads them. */
     const double end_timestep_time = parameters_.labclock->next_time();
     while (next_output_time() < end_timestep_time) {
-#pragma omp parallel for schedule(dynamic) if (parallel_perform)
+#pragma omp parallel for schedule(runtime) if (parallel_perform)
       for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
         random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
         run_time_evolution_timestepless(actions[i_ens], i_ens,
@@ -2794,7 +2809,7 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
 
       intermediate_output();
     }
-#pragma omp parallel for schedule(dynamic) if (parallel_perform)
+#pragma omp parallel for schedule(runtime) if (parallel_perform)
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
       random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
       run_time_evolution_timestepless(actions[i_ens], i_ens, end_timestep_time);
@@ -2953,6 +2968,15 @@ void Experiment<Modus>::run_time_evolution_timestepless(
   logg[LExperiment].debug(
       "Timestepless propagation: ", "Actions size = ", actions.size(),
       ", end time = ", end_time_propagation);
+
+  /* Reseed this thread's Pythia from the current ensemble's RNG stream (the
+   * caller wraps this in a ScopedEngine for ensemble i_ensemble). This makes the
+   * string fragmentation a deterministic function of the ensemble index, so the
+   * parallel-strings result is reproducible for any thread count. No-op when
+   * strings are off. */
+  for (const auto &finder : action_finders_) {
+    finder->reseed_string_process();
+  }
 
   // iterate over all actions
   while (!actions.is_empty()) {
@@ -3280,6 +3304,12 @@ void Experiment<Modus>::do_final_interactions() {
     reduction(|| : actions_found)
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
       random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
+      // Reseed this thread's Pythia from the ensemble's stream (see
+      // run_time_evolution_timestepless); here finding and performing happen in
+      // the same iteration, so the same thread owns and uses its StringProcess.
+      for (const auto &finder : action_finders_) {
+        finder->reseed_string_process();
+      }
       Actions actions;
       // Dileptons: shining of remaining resonances
       if (dilepton_finder_ != nullptr) {

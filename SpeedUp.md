@@ -279,8 +279,61 @@ optimization — output unchanged). The momentum-update loop itself was left
 `single_particle_energy_gradient`) is not thread-safe (it aborts under threads),
 so a real mean-field speedup needs (a) a thread-safe force evaluation, (b) a
 parallel momentum loop, and (c) the per-thread partial-lattice reduction for
-`update_potentials`. That is the scoped mean-field follow-on; strings need the
-per-thread Pythia. Both are the high-risk items the plan deferred.
+`update_potentials`. That is the scoped mean-field follow-on. (The strings
+follow-on is now implemented — see "Phase 2 strings" below.)
+
+### Phase 2 strings — per-thread Pythia
+
+The deepest wall: `ScatterActionsFinder` owned a single, stateful
+`StringProcess`/Pythia, mutated during both finding and performing, so two
+threads touching it race.
+
+**What changed**
+
+- `ScatterActionsFinder` now holds **one `StringProcess`/Pythia per OpenMP
+  thread** (`string_processes_`), built once in the constructor with identical
+  parameters (`omp_get_max_threads()` of them). Each created action is handed
+  the **calling thread's** instance (`string_process_for_thread()`).
+- With strings on the ensemble find/perform loops use a **static** schedule
+  (`omp_set_schedule`, `schedule(runtime)`), so the thread that *finds* an
+  ensemble's actions is the one that *performs* them — hence the only thread
+  touching that thread's Pythia. No strings → dynamic schedule as before.
+- Each ensemble's Pythia is **reseeded from that ensemble's RNG stream** before
+  performing (`reseed_string_process()`), drawing on the fact that SMASH already
+  seeds Pythia from its own engine. This makes the fragmentation a deterministic
+  function of the ensemble index.
+- Parallelization is therefore **enabled for strings** (`parallel_find = true`);
+  the only remaining serial-only case is per-interaction output (ordered output).
+
+**Cost.** N_threads Pythia instances → ~Pythia-init seconds and tens of MB each
+at start-up (bounded; excluded from the evolution timing).
+
+**Verification** (collider, `Strings: True`, `Sqrtsnn = 17.3` GeV):
+
+| Case | Check | Result |
+|---|---|---|
+| O+O, 4 ens (moderate strings) | md5 across threads 1/2/4 | **bit-identical** (`8669cafe…`) |
+| Au+Au, 8 ens (heavy strings) | determinism (8 threads, twice) | identical (`eaf7ef39…`) |
+| Au+Au, 8 ens | total energy, 1 vs 8 threads | 27264.800587 vs …591 — **Δ/E = 1.7e-10** |
+| Au+Au, 8 ens | total charge, 1 vs 8 threads | 1264 vs 1264 — **exact** |
+| Au+Au, 8 ens | speedup (evolution) | **1.35× (2t), 1.97× (4t), 2.13× (8t)** |
+
+**Reproducibility caveat (honest).** For *moderate* string activity the result is
+**bit-identical across thread counts**. For *heavy* string activity (Au+Au, tens
+of thousands of fragmentations) it is **physically equivalent but not
+bit-identical** across thread counts: energy is conserved to 1.7e-10 and charge
+*exactly*, but the produced-hadron multiplicity differs by ~0.3% (well within √N
+statistics). The cause is Pythia's **internal fragmentation state**, which
+`rndm.init` (the reseed) does not fully reset, so the differing per-thread call
+*sequence* re-keys the sampling. It is **deterministic for a fixed thread count**.
+Fully resetting Pythia per fragmentation (to recover bit-identity) is expensive
+and is the remaining refinement; the physics is correct as-is. This is exactly
+the deep Pythia-statefulness wall the plan and issue #3075 anticipated.
+
+**Speedup is modest (~2×)** because a single high-energy event is sub-second
+(fragmentation is fast per string), the per-ensemble Pythia reseed adds overhead,
+and Au+Au events are load-imbalanced; the win grows with the number of ensembles
+and the string fraction of the work.
 
 The no-output covariant box parallelizes both finding and performing and scales
 near-linearly up to the number of ensembles; the collision-output stochastic box
@@ -448,6 +501,7 @@ discrete-GPU loss into a **modest (1.4–2×) win** for the GPU-viable physics.
 | 0 | Serial warm-up of lazy resonance caches | ✅ | enabler; stochastic byte-identical, covariant conserves to ≤2e-8 |
 | 1 | thread_local RNG + per-ensemble seeding | ✅ | 1-ensemble byte-identical; reproducible by construction |
 | 2 | OpenMP over ensembles | ✅ | **3.3× (4t), 5.5–6.5× (8t)**, bit-identical across thread counts |
+| 2 strings | per-thread Pythia | ✅ | **2.1× (8t)**; bit-identical (moderate strings) / conserved to 1.7e-10 (heavy strings) |
 | 3a | Cell-parallel finding (single big event) | ✅ | **3.9× (8t)**, bit-identical across thread counts |
 | 4 | GPU prototype (propagation + stochastic finding) | ✅ | GPU == CPU exactly; **1.4–2× on GB10** with coherent/resident memory (modest, memory-bound) |
 
@@ -467,13 +521,14 @@ across `OMP_NUM_THREADS = 1/2/4/8`**; energy/momentum/charge/baryon number are
 conserved throughout (the box configs enforce this every time step and never
 tripped); the GPU kernels reproduce the CPU result exactly.
 
-**Scoped follow-ons (per the plan, not done here).** Phase 2 strings
-(per-thread Pythia); the mean-field speedup (thread-safe force evaluation +
-parallel `update_momenta` + per-thread partial-lattice reduction); stochastic
-Phase 3a (counter-based pair RNG, prototyped on the GPU); Phase 3b domain
-decomposition; full GPU integration with device-resident SoA data. A
-ThreadSanitizer pass would also formalize the one remaining benign same-value
-race noted under Phase 2.
+**Scoped follow-ons (per the plan, not done here).** The mean-field speedup
+(thread-safe force evaluation + parallel `update_momenta` + per-thread
+partial-lattice reduction); bit-identical heavy-strings reproducibility (a full
+Pythia state reset per fragmentation — the physics is already correct, conserved
+to 1.7e-10); stochastic Phase 3a (counter-based pair RNG, prototyped on the GPU);
+Phase 3b domain decomposition; full GPU integration with device-resident SoA
+data. A ThreadSanitizer pass would also formalize the one remaining benign
+same-value race noted under Phase 2 and check Pythia's static state.
 
 ## Reproducing the measurements
 

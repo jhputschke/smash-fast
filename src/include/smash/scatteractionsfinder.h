@@ -257,12 +257,28 @@ class ScatterActionsFinder : public ActionFinderInterface {
    *         If string is turned off, the null pointer is returned.
    */
   StringProcess *get_process_string_ptr() {
-    if (finder_parameters_.strings_switch) {
-      return string_process_interface_.get();
+    if (finder_parameters_.strings_switch && !string_processes_.empty()) {
+      return string_processes_[0].get();
     } else {
       return NULL;
     }
   }
+
+  /**
+   * \return The StringProcess instance owned by the calling OpenMP thread, or
+   *         nullptr if strings are off. Each thread gets its own Pythia so that
+   *         the ensemble loop can be parallelized with strings on (Phase 2
+   *         strings follow-on).
+   */
+  StringProcess *string_process_for_thread() const;
+
+  /**
+   * Reseed the calling thread's Pythia from the current (per-ensemble) RNG
+   * stream. Called once per ensemble before performing its actions, so that the
+   * string fragmentation is a deterministic function of the ensemble index and
+   * therefore reproducible for any number of threads.
+   */
+  void reseed_string_process() const override;
 
  private:
   /**
@@ -312,8 +328,14 @@ class ScatterActionsFinder : public ActionFinderInterface {
 
   /// Struct collecting several parameters.
   ScatterActionsFinderParameters finder_parameters_;
-  /// Class that deals with strings, interfacing Pythia.
-  std::unique_ptr<StringProcess> string_process_interface_;
+  /**
+   * Classes that deal with strings, interfacing Pythia — one per OpenMP thread.
+   * Built with identical parameters in the constructor (Pythia init is costly,
+   * but the count is bounded by the thread number). Empty if strings are off.
+   * Each thread uses its own instance so the parallel ensemble loop is
+   * thread-safe with strings on.
+   */
+  std::vector<std::unique_ptr<StringProcess>> string_processes_;
   /// Do all collisions isotropically.
   const bool isotropic_;
   /**
