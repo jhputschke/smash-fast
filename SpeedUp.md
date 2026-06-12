@@ -394,34 +394,50 @@ ingredient a future stochastic Phase 3a would use.
 
 So the GPU-viable physics is reproduced **exactly** on the GPU.
 
-**Timing — and the honest verdict.** Comparing the GPU against the *already
-parallel* 20-thread CPU (the fair baseline after Phase 2):
+**Timing — measured properly for this hardware.** The first measurement used
+explicit `cudaMemcpy`, which is the *discrete-GPU* model and overstated the cost
+on GB10. GB10 reports `Addressing Mode: ATS` — the GPU coherently accesses system
+memory, so the explicit copy is avoidable. `gpu/unified_memory_bench.cu`
+re-measures the same propagation+finding **end-to-end** (CPU input already in
+memory → compute → CPU reads the result back) under each memory model, against
+the *already parallel* 20-thread Grace CPU:
 
-| Size | CPU (20 thr) | GPU kernels | GPU H2D | GPU D2H | kernel-only | incl. transfer |
-|---|---|---|---|---|---|---|
-| 320k part / 6.2M pairs | 2.89 ms | 1.06 ms | 0.39 ms | 3.46 ms | 2.7× | **0.6×** |
-| 885k part / 28M pairs | 8.49 ms | 4.07 ms | 0.89 ms | 11.8 ms | 2.1× | **0.5×** |
+| Memory model | 885k part / 28M pairs | 3.1M part / 142M pairs |
+|---|---|---|
+| **CPU** (20 threads, baseline) | 7.6 ms | 34.0 ms |
+| GPU, explicit `cudaMemcpy` (discrete model) | 1.1× | 1.2× |
+| GPU, `cudaMallocManaged` (on-demand migration) | **1.4–1.5×** | 1.4× |
+| GPU, plain `malloc` → kernel (ATS coherent) | ~1.4× | 1.4× |
+| GPU, **resident** (data never leaves device) | **2.0×** | 1.7× |
 
-This is exactly the wall the analysis predicted:
+So the corrected answer: **yes, there is a benefit on GB10, but a modest one.**
 
-- The kernels beat 20 CPU threads only modestly (~2–3×): the work is cheap and
-  **memory-bound**, not compute-bound, so the GPU's arithmetic advantage is
-  largely wasted.
-- Once the host↔device **transfer** of the result is included, the GPU is
-  *slower than the CPU* (0.5–0.6×). The device-to-host copy dominates.
+- Coherent/unified memory **removes most of the "transfer wall"**: the same work
+  that looked like 0.5× under the naive explicit-copy model is **1.4–1.5×** with
+  managed/ATS memory, and **~2×** if the data stays resident on the GPU. My
+  initial "transfer-bound, not worth it" was the *discrete-GPU* conclusion; on a
+  coherent part it is too pessimistic.
+- But the ceiling is only **~2×**, because these kernels are
+  **memory-bandwidth-bound**, not compute-bound — the cheap physics (a propagate
+  and a few flops per pair) never uses the GPU's arithmetic throughput, and on
+  GB10 the Grace and Blackwell sides share an LPDDR memory system, so the
+  bandwidth advantage over the CPU is small. A discrete HBM GPU would show a
+  larger kernel-only ratio but reintroduce the copy.
 
-**Verdict (matches the plan).** A *partial* offload of the cheap physics is not
-worth it — it is transfer-bound, because the expensive physics (cross sections,
-strings, the time-ordered action heap) must stay on the CPU, so data ping-pongs
-every step. The GPU is only worth it for the narrow **box + stochastic +
-no-strings + lattice-density** configuration **with device-resident data** (no
-per-step transfers), where the kernels' 2–3× (and more with a better-tuned
-finding kernel) would actually be realized. GB10's coherent memory softens but
-does not remove the transfer cost (the explicit D2H here still dominates); it
-makes the device-resident, zero-copy design more attractive than on a
-discrete-GPU host. General heavy-ion-with-strings remains CPU+OpenMP territory
-(Phase 2). The prototype proves both halves concretely: the kernels are
-**correct and reproducible**, and the transfer wall is **real**.
+**Verdict (refined for GB10).** The benefit is real but bounded to ~2× and only
+materializes when (a) the data is **device-resident** across time steps — so the
+geometry/positions/velocities live on the GPU and only summaries cross back — and
+(b) the configuration is the GPU-viable corner (**box + stochastic + no strings +
+lattice density**), where the GPU-viable kernels are most of the work. There it
+is worth pursuing on GB10 specifically, precisely because coherent memory makes
+the resident, low-copy design practical. For general heavy-ion-with-strings it is
+still not worth it: the expensive physics (cross sections, Pythia strings, the
+time-ordered action heap) is CPU-only and branchy, so it bottlenecks (Amdahl) and
+forces a CPU↔GPU hand-off every step regardless of how cheap the memory coherence
+makes that hand-off. CPU+OpenMP (Phase 2) remains the general answer. The
+prototype proves both halves concretely: the kernels are **correct and
+reproducible**, and — measured the right way — the GB10 unified memory turns a
+discrete-GPU loss into a **modest (1.4–2×) win** for the GPU-viable physics.
 
 ---
 
@@ -433,7 +449,7 @@ discrete-GPU host. General heavy-ion-with-strings remains CPU+OpenMP territory
 | 1 | thread_local RNG + per-ensemble seeding | ✅ | 1-ensemble byte-identical; reproducible by construction |
 | 2 | OpenMP over ensembles | ✅ | **3.3× (4t), 5.5–6.5× (8t)**, bit-identical across thread counts |
 | 3a | Cell-parallel finding (single big event) | ✅ | **3.9× (8t)**, bit-identical across thread counts |
-| 4 | GPU prototype (propagation + stochastic finding) | ✅ | GPU == CPU exactly; transfer-bound (0.5–0.6× incl. copy) |
+| 4 | GPU prototype (propagation + stochastic finding) | ✅ | GPU == CPU exactly; **1.4–2× on GB10** with coherent/resident memory (modest, memory-bound) |
 
 **The deliverable.** Ensemble-level OpenMP (Phase 2) is the headline: for the
 no-strings, many-ensemble case — a large fraction of production runs — SMASH now
