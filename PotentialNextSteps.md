@@ -51,7 +51,9 @@ Known limitations of the current implementations — these *are* the near-term w
 **Highest-value first step: profile.** A `perf`/VTune profile of the 8-thread
 post-gather run would identify the *next* bottleneck (collision finding? Pauli
 blocking? propagation? I/O?) and replace the guesses below with data. Everything
-else should be prioritized off that profile.
+else should be prioritized off that profile. The prime suspect is **Pauli
+blocking** (ON in this config), whose phase-space density does a brute-force O(N)
+particle scan per query with a known-inefficient TODO in the source — see §4.
 
 ---
 
@@ -161,10 +163,31 @@ brent loop entirely on device. Naturally rides along with 3c.
 - **Adaptive / multiresolution lattice.** The collision region is a small fraction
   of the 80³ lattice; an adaptive or octree lattice would cut both the node-loop
   and the fill cost, and shrink the GPU working set.
-- **Pauli blocking.** The SIS config runs Pauli blocking ON (spatial + momentum
-  phase-space averaging per candidate collision), a plausibly significant and
-  not-yet-profiled cost; a tabulated blocking integral or a parallel evaluation
-  may help. Profile first.
+- **Pauli blocking — the one place a fast nearest-neighbor search would clearly
+  help.** Everywhere else proximity search is already a *subleading* cost because
+  SMASH uses the right structure: collision finding uses a uniform **linked-cell
+  grid** (`src/grid.cc`, cell size = `max_interaction_length`, half-stencil
+  neighbor callback) and the density gather uses a cell-list. For short-range,
+  fixed-radius, 3D, bounded-density queries those are O(N) and cache-friendly and
+  **beat kd-/ball-trees** (which only win for *k*-NN, variable radii, very
+  non-uniform data, or high dimension); the dominant cost there is the per-pair
+  physics (cross sections, the smearing `exp`/boost), not the enumeration. The
+  exception is `PauliBlocker::phasespace_dens()`, which does a **brute-force O(N)
+  scan over every particle in every ensemble per query** — SMASH's own source
+  flags it: *"looping over all particles is inefficient ... some search algorithm
+  might help."* It is called once per candidate blocked (fermion) collision,
+  scanning all ~25 600 test-particles each time, and **Pauli blocking is ON in the
+  SIS config benchmarked here**, so the cost is ≈ O(N_queries × N_particles) and
+  plausibly *leading* for that config. The fix is low-risk and needs no new
+  algorithm: **reuse the existing grid** to pre-cull by the `rr_+rc_` coordinate
+  sphere, then apply the momentum (`rp_`) filter — turning the O(N) scan into
+  O(neighbors). (A tabulated blocking integral / parallel evaluation could stack
+  on top.) Profile first to confirm its share, but this is the prime suspect.
+- **Verlet-style neighbor lists reused across timesteps.** A refinement of the
+  *existing* grids (collisions, density, and a future Pauli grid), not a
+  replacement: build the neighbor list with a skin radius and rebuild only when a
+  particle moves past the skin, amortizing the per-step rebuild over several steps
+  for small `Δt`. Needs drift/error control.
 - **Reduced-precision lattice storage.** Storing the lattice currents in FP32
   (independent of the FP32-compute idea) halves the dominant memory traffic of the
   per-node loops; same precision-drift study applies.
