@@ -767,6 +767,12 @@ double KaonNucleonRatios::get_ratio(const ParticleType& a,
   return ratios_.at(key);
 }
 
+void KaonNucleonRatios::ensure_initialized() const {
+  if (ratios_.empty()) {
+    initialize(ratios_);
+  }
+}
+
 /*thread_local (see #3075)*/ KaonNucleonRatios kaon_nucleon_ratios;
 
 double kminusp_kbar0n(double mandelstam_s) {

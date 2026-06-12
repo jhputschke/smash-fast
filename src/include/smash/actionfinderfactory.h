@@ -89,6 +89,14 @@ class ActionFinderInterface {
    * \return The function returns a list (std::vector) of Action objects.
    */
   virtual ActionList find_final_actions(const Particles &search_list) const = 0;
+
+  /**
+   * Reseed any per-thread random state owned by this finder for the current
+   * ensemble. Only the string (Pythia) finder overrides this; the default is a
+   * no-op. Used to keep parallel string fragmentation reproducible (Phase 2
+   * strings).
+   */
+  virtual void reseed_string_process() const {}
 };
 
 }  // namespace smash

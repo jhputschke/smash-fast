@@ -119,9 +119,7 @@ class Potentials {
                                   const FourVector &jmu_B, double mass) const {
     std::function<double(double)> root_equation = [momentum, jmu_B, mass,
                                                    this](double energy) {
-      return root_eq_potentials(energy, momentum, jmu_B, mass, skyrme_a_,
-                                skyrme_b_, skyrme_tau_, mom_dependence_C_,
-                                mom_dependence_Lambda_);
+      return root_eq_potentials(energy, momentum, jmu_B, mass);
     };
     RootSolver1D root_solver{root_equation};
     constexpr std::size_t max_number_root_solver_iterations = 100000;
@@ -569,6 +567,36 @@ class Potentials {
    */
   double mom_dependence_C_;
 
+  /**
+   * Pre-tabulated local-rest-frame potential
+   * U(p, rho) = skyrme_pot(rho) + momentum_dependent_part(p, rho) on a uniform
+   * 2-D grid, used to make the momentum-dependent root solve cheap (see
+   * interpolate_lrf_potential() / root_eq_potentials()). Built once at
+   * construction when momentum dependence is enabled. Values are stored
+   * row-major as values[ip * n_rho + irho].
+   */
+  struct LrfPotentialTable {
+    /// Whether the table has been built (otherwise compute U directly).
+    bool ready = false;
+    /// Number of momentum / density grid points.
+    int n_p = 0, n_rho = 0;
+    /// Upper grid bounds: momentum [GeV] and density [1/fm^3] (lower bound 0).
+    double p_max = 0.0, rho_max = 0.0;
+    /// Inverse grid spacings (1/dp, 1/drho).
+    double inv_dp = 0.0, inv_drho = 0.0;
+    /// Tabulated U values [GeV], size n_p * n_rho.
+    std::vector<double> values;
+  };
+  /// The tabulated local-rest-frame potential.
+  LrfPotentialTable lrf_pot_table_;
+
+  /**
+   * Build lrf_pot_table_ by evaluating
+   * skyrme_pot(rho) + momentum_dependent_part(p, rho) on a uniform grid.
+   * Called once from the constructor when momentum dependence is on.
+   */
+  void build_lrf_potential_table();
+
   /// Parameter S_Pot in the symmetry potential in MeV
   double symmetry_S_Pot_;
 
@@ -676,11 +704,21 @@ class Potentials {
    * \return effective mass squared in calculation frame
    *         minus effective mass in rest_frame in GeV^2
    */
-  static double root_eq_potentials(double energy_calc,
-                                   const ThreeVector &momentum_calc,
-                                   const FourVector &jmu, double m, double A,
-                                   double B, double tau, double C,
-                                   double Lambda) {
+  /**
+   * Root equation whose zero (in \p energy_calc) gives the calculation-frame
+   * single-particle energy for the momentum-dependent potential.
+   *
+   * The expensive, repeatedly-evaluated part is the local-rest-frame potential
+   * U(p_LRF, rho_LRF) = skyrme_pot + momentum_dependent_part (transcendentals).
+   * It depends only on (p_LRF, rho_LRF) with all parameters fixed per run, so it
+   * is pre-tabulated once (see build_lrf_potential_table()) and looked up here
+   * via interpolate_lrf_potential() — turning each root-finder iteration from a
+   * handful of transcendental calls into a cheap 2-D interpolation. This is a
+   * non-static const member so it can reach that table.
+   */
+  double root_eq_potentials(double energy_calc,
+                            const ThreeVector &momentum_calc,
+                            const FourVector &jmu, double m) const {
     // get velocity for boost to the local rest frame
     double rho_LRF = jmu.abs();
     ThreeVector beta_LRF = jmu.x0() > really_small ? jmu.threevec() / jmu.x0()
@@ -691,17 +729,47 @@ class Potentials {
                              ? pmu_calc.lorentz_boost(beta_LRF)
                              : pmu_calc;
     double p_LRF = pmu_LRF.threevec().abs();
-    double energy_LRF = std::sqrt(m * m + p_LRF * p_LRF) +
-                        skyrme_pot(rho_LRF, A, B, tau) +
-                        momentum_dependent_part(p_LRF, rho_LRF, C, Lambda);
+    double energy_LRF =
+        std::sqrt(m * m + p_LRF * p_LRF) + interpolate_lrf_potential(p_LRF, rho_LRF);
     const double result = energy_calc * energy_calc - momentum_calc.sqr() -
                           (energy_LRF * energy_LRF - p_LRF * p_LRF);
-    logg[LPotentials].debug()
-        << "root equation for potentials called with E_calc=" << energy_calc
-        << " p_calc=" << momentum_calc << " jmu=" << jmu << " m=" << m
-        << " tau=" << tau << " A=" << A << " B=" << B << " C=" << C
-        << " Lambda=" << Lambda << " and the root equation is " << result;
     return result;
+  }
+
+  /**
+   * Local-rest-frame momentum-dependent + Skyrme potential
+   * U(p_LRF, rho) = skyrme_pot(rho) + momentum_dependent_part(p_LRF, rho).
+   * Returns the tabulated value if the table has been built (the common path,
+   * built once at construction), otherwise computes it directly. The table is
+   * a uniform bilinear grid; values are clamped to the tabulated range.
+   *
+   * \param[in] p Local-rest-frame momentum [GeV].
+   * \param[in] rho Local-rest-frame baryon density [1/fm^3].
+   * \return U in GeV.
+   */
+  double interpolate_lrf_potential(double p, double rho) const {
+    const LrfPotentialTable &t = lrf_pot_table_;
+    if (!t.ready) {
+      return skyrme_pot(rho, skyrme_a_, skyrme_b_, skyrme_tau_) +
+             momentum_dependent_part(p, rho, mom_dependence_C_,
+                                     mom_dependence_Lambda_);
+    }
+    double pp = p < 0.0 ? 0.0 : (p > t.p_max ? t.p_max : p);
+    double rr = rho < 0.0 ? 0.0 : (rho > t.rho_max ? t.rho_max : rho);
+    const double fp = pp * t.inv_dp;
+    const double fr = rr * t.inv_drho;
+    int ip = static_cast<int>(fp);
+    int ir = static_cast<int>(fr);
+    if (ip > t.n_p - 2) ip = t.n_p - 2;
+    if (ir > t.n_rho - 2) ir = t.n_rho - 2;
+    const double wp = fp - ip;
+    const double wr = fr - ir;
+    const std::vector<double> &v = t.values;
+    const int base = ip * t.n_rho + ir;
+    return (1.0 - wp) * (1.0 - wr) * v[base] +
+           wp * (1.0 - wr) * v[base + t.n_rho] +
+           (1.0 - wp) * wr * v[base + 1] +
+           wp * wr * v[base + t.n_rho + 1];
   }
 
   /**

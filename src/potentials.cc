@@ -66,9 +66,42 @@ Potentials::Potentials(Configuration conf, const DensityParameters &param)
       powers_.push_back(aux_powers[i]);
     }
   }
+  if (use_momentum_dependence_) {
+    build_lrf_potential_table();
+  }
 }
 
 Potentials::~Potentials() {}
+
+void Potentials::build_lrf_potential_table() {
+  /* Tabulate U(p, rho) = skyrme_pot(rho) + momentum_dependent_part(p, rho) on a
+   * uniform 2-D grid. The bounds are generous: local-rest-frame momenta are well
+   * below 20 GeV and baryon densities a few times nuclear density; values beyond
+   * the grid are clamped (the function is smooth there). The grid is fine so the
+   * bilinear interpolation error is negligible against SMASH's other tolerances.
+   * Built once; the parameters are fixed for the run. */
+  LrfPotentialTable &t = lrf_pot_table_;
+  t.p_max = 20.0;    // GeV
+  t.rho_max = 5.0;   // 1/fm^3
+  t.n_p = 2001;
+  t.n_rho = 1001;
+  const double dp = t.p_max / (t.n_p - 1);
+  const double drho = t.rho_max / (t.n_rho - 1);
+  t.inv_dp = 1.0 / dp;
+  t.inv_drho = 1.0 / drho;
+  t.values.resize(static_cast<size_t>(t.n_p) * t.n_rho);
+  for (int ip = 0; ip < t.n_p; ip++) {
+    const double p = ip * dp;
+    for (int irho = 0; irho < t.n_rho; irho++) {
+      const double rho = irho * drho;
+      t.values[static_cast<size_t>(ip) * t.n_rho + irho] =
+          skyrme_pot(rho, skyrme_a_, skyrme_b_, skyrme_tau_) +
+          momentum_dependent_part(p, rho, mom_dependence_C_,
+                                  mom_dependence_Lambda_);
+    }
+  }
+  t.ready = true;
+}
 
 double Potentials::skyrme_pot(const double baryon_density, const double A,
                               const double B, const double tau) {

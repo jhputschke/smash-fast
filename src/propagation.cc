@@ -134,21 +134,36 @@ void update_momenta(
     RectangularLattice<std::pair<ThreeVector, ThreeVector>> *FI3_lat,
     RectangularLattice<std::pair<ThreeVector, ThreeVector>> *EM_lat,
     DensityLattice *jB_lat) {
-  // Copy particles from ALL ensembles to a single list before propagation
-  // and calculate potentials from this list
-  ParticleList plist;
-  for (Particles &particles : ensembles) {
-    const ParticleList tmp = particles.copy_to_vector();
-    plist.insert(plist.end(), tmp.begin(), tmp.end());
-  }
-
   bool possibly_use_lattice =
       (pot.use_skyrme() ? (FB_lat != nullptr) : true) &&
       (pot.use_vdf() ? (FB_lat != nullptr) : true) &&
       (pot.use_symmetry() ? (FI3_lat != nullptr) : true);
+
+  /* The single all-ensemble particle list is only needed for the O(N^2)
+   * no-lattice force fallback (pot.all_forces) and for the momentum-dependent
+   * energy gradient. When the lattice is used and neither of those applies it is
+   * never read, so skip the wasteful copy of every particle of every ensemble
+   * (this is the common mean-field case and a serial cost each time step). */
+  const bool need_plist = !possibly_use_lattice ||
+                          pot.use_potentials_outside_lattice() ||
+                          pot.use_momentum_dependence();
+  ParticleList plist;
+  if (need_plist) {
+    for (Particles &particles : ensembles) {
+      const ParticleList tmp = particles.copy_to_vector();
+      plist.insert(plist.end(), tmp.begin(), tmp.end());
+    }
+  }
   std::pair<ThreeVector, ThreeVector> FB, FI3, EM_fields;
   double min_time_scale = std::numeric_limits<double>::infinity();
 
+  /* NOTE: this momentum-update loop is kept serial. Although it is independent
+   * per particle given the lattice, the potential force evaluation
+   * (Potentials::all_forces / single_particle_energy_gradient) is not currently
+   * thread-safe (it aborts under threads), so parallelizing it together with a
+   * thread-safe force evaluation and a parallel lattice reduction is left as the
+   * mean-field follow-on. The wasteful all-ensemble plist copy above is now
+   * skipped when unused, which removes the main avoidable serial cost here. */
   for (Particles &particles : ensembles) {
     for (ParticleData &data : particles) {
       // Only baryons and nuclei will be affected by the potentials

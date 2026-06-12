@@ -19,6 +19,8 @@ build*
 .project
 .settings/
 __pycache__/
-
+pythia*/
 # Convenience directory for your own files that should not be tracked
 tmp
+# Speedup verification scratch (outputs, tabulation cache, logs)
+verify/

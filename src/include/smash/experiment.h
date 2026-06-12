@@ -14,6 +14,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "actionfinderfactory.h"
 #include "actions.h"
@@ -325,6 +328,27 @@ class Experiment : public ExperimentBase {
   void run_time_evolution_timestepless(Actions &actions, int i_ensemble,
                                        const double end_time_propagation);
 
+  /**
+   * Cell-parallel action finding for a single ensemble (Phase 3a).
+   *
+   * Distributes the expensive per-cell pair search of one grid over OpenMP
+   * threads, accumulating per-cell results and merging them in the serial
+   * cell-iteration order. Used for the single-big-event regime where the
+   * ensemble loop offers no parallelism. Restricted to the geometric/covariant
+   * criteria; the per-task deterministic seeding (see the body) makes the result
+   * bit-reproducible for any thread count, though not identical to the serial
+   * cell order (the decay-time RNG stream is re-keyed per task).
+   *
+   * \tparam G The grid type (normal or periodic boundaries).
+   * \param[in] grid The spatial grid to search.
+   * \param[in] dt The current time step size [fm].
+   * \param[in] gcell_vol The grid-cell volume (for the stochastic criterion).
+   * \param[out] out The actions container to fill.
+   */
+  template <typename G>
+  void find_actions_cell_parallel(const G &grid, double dt, double gcell_vol,
+                                  Actions &out);
+
   /// Intermediate output during an event
   void intermediate_output();
 
@@ -384,6 +408,17 @@ class Experiment : public ExperimentBase {
   std::vector<Particles> ensembles_;
 
   /**
+   * One persistent random-number engine state per ensemble (Phase 1).
+   *
+   * Each ensemble draws from its own stream, seeded as a deterministic function
+   * of the per-event master seed and the ensemble index (see
+   * random::derive_seed). The state is swapped into the global thread-local
+   * engine while an ensemble is processed (see random::ScopedEngine), so the
+   * result is identical for any number of OpenMP threads.
+   */
+  std::vector<random::Engine> ensemble_rng_;
+
+  /**
    * An instance of potentials class, that stores parameters of potentials,
    * calculates them and their gradients.
    */
@@ -410,8 +445,13 @@ class Experiment : public ExperimentBase {
   /**
    * Whether the projectile and the target collided.
    * One value for each ensemble.
+   *
+   * Stored as char rather than bool: std::vector<bool> is bit-packed, so
+   * concurrent writes to different ensembles would touch the same word. With
+   * char each ensemble owns a distinct byte, which is safe to write in parallel
+   * (Phase 2).
    */
-  std::vector<bool> projectile_target_interact_;
+  std::vector<char> projectile_target_interact_;
 
   /**
    * The initial nucleons in the ColliderModus propagate with
@@ -704,6 +744,69 @@ class Experiment : public ExperimentBase {
    */
   double total_energy_violated_by_Pythia_ = 0.0;
 
+  /**
+   * Per-ensemble accumulators for the counters above (Phase 2).
+   *
+   * During the parallel-over-ensembles region every ensemble writes only to its
+   * own entry, so there is no race. After the region the entries are reduced
+   * into the scalar totals above by sync_ensemble_counters(). The scalars remain
+   * the single source of truth read by the output/reporting code. Crucially,
+   * the per-ensemble interaction count also drives `id_process` so that particle
+   * process tags do not entangle across ensembles. The struct is cache-line
+   * aligned to avoid false sharing between adjacent ensembles.
+   */
+  struct alignas(64) EnsembleScalars {
+    /// Number of performed interactions in this ensemble.
+    uint64_t interactions_total = 0;
+    /// Number of wall crossings in this ensemble.
+    uint64_t wall_actions = 0;
+    /// Number of Pauli-blocked interactions in this ensemble.
+    uint64_t pauli_blocked = 0;
+    /// Number of hypersurface-crossing actions in this ensemble.
+    uint64_t hypersurface_crossings = 0;
+    /// Number of discarded (invalidated) interactions in this ensemble.
+    uint64_t discarded_interactions = 0;
+    /// Energy removed by hypersurface crossings in this ensemble.
+    double energy_removed = 0.0;
+    /// Energy violation introduced by Pythia in this ensemble.
+    double energy_violated_by_pythia = 0.0;
+  };
+  /// Per-ensemble counter accumulators, one entry per ensemble.
+  std::vector<EnsembleScalars> ens_scalars_;
+
+  /**
+   * True if any configured output writes from inside perform_action() or the
+   * time-stepless propagation (collision, dilepton, photon or initial-condition
+   * output). When true the per-ensemble *performing* loop is kept serial so the
+   * output stays deterministically ordered; the action *finding* loop, which
+   * produces no output, is parallelized regardless. Set in create_output().
+   */
+  bool has_per_interaction_output_ = false;
+
+  /**
+   * Reduce the per-ensemble counter accumulators into the scalar totals.
+   * Called after each parallel-over-ensembles performing region, before any
+   * code reads the scalar totals.
+   */
+  void sync_ensemble_counters() {
+    interactions_total_ = 0;
+    wall_actions_total_ = 0;
+    total_pauli_blocked_ = 0;
+    total_hypersurface_crossing_actions_ = 0;
+    discarded_interactions_total_ = 0;
+    total_energy_removed_ = 0.0;
+    total_energy_violated_by_Pythia_ = 0.0;
+    for (const auto &e : ens_scalars_) {
+      interactions_total_ += e.interactions_total;
+      wall_actions_total_ += e.wall_actions;
+      total_pauli_blocked_ += e.pauli_blocked;
+      total_hypersurface_crossing_actions_ += e.hypersurface_crossings;
+      discarded_interactions_total_ += e.discarded_interactions;
+      total_energy_removed_ += e.energy_removed;
+      total_energy_violated_by_Pythia_ += e.energy_violated_by_pythia;
+    }
+  }
+
   /// This indicates whether kinematic cuts are enabled for the IC output
   bool kinematic_cuts_for_IC_output_ = false;
 
@@ -731,6 +834,15 @@ void Experiment<Modus>::create_output(const std::string &format,
                                       const std::string &content,
                                       const std::filesystem::path &output_path,
                                       const OutputParameters &out_par) {
+  /* Track whether any output writes from inside perform_action()/the
+   * time-stepless propagation. Such per-interaction output forces the
+   * performing loop to stay serial so its records remain deterministically
+   * ordered (Phase 2). Particle/Thermodynamics output only writes at the
+   * serial barriers and is therefore compatible with parallel performing. */
+  if (content == "Collisions" || content == "Dileptons" ||
+      content == "Photons" || content == "Initial_Conditions") {
+    has_per_interaction_output_ = true;
+  }
   // Disable output which do not properly work with multiple ensembles
   if (ensembles_.size() > 1) {
     auto abort_because_of = [](const std::string &s) {
@@ -2061,6 +2173,10 @@ EventInfo fill_event_info(const std::vector<Particles> &ensembles,
 template <typename Modus>
 void Experiment<Modus>::initialize_new_event() {
   random::set_seed(seed_);
+  /* Master seed of this event, used to derive one independent RNG stream per
+   * ensemble below (Phase 1). Captured before the engine is advanced for the
+   * next event's seed. */
+  const uint64_t event_master_seed = static_cast<uint64_t>(seed_);
   logg[LExperiment].info() << "random number seed: " << seed_;
   /* Set seed for the next event. It has to be positive, so it can be entered
    * in the config.
@@ -2094,14 +2210,27 @@ void Experiment<Modus>::initialize_new_event() {
     logg[LExperiment].info("Impact parameter = ", modus_.impact_parameter(),
                            " fm");
   }
-  for (Particles &particles : ensembles_) {
-    start_time = modus_.initial_conditions(&particles, parameters_);
-  }
-  /* For box modus make sure that particles are in the box. In principle, after
-   * a correct initialization they should be, so this is just playing it safe.
-   */
-  for (Particles &particles : ensembles_) {
-    modus_.impose_boundary_conditions(&particles, outputs_);
+  /* Phase 1: give each ensemble its own persistent RNG stream before sampling
+   * its initial conditions. Ensemble 0 inherits the live engine state, so a
+   * single-ensemble run reproduces the legacy sequence exactly; ensembles > 0
+   * are seeded from independent derived seeds. The streams depend only on the
+   * master seed and the ensemble index, never on thread scheduling, which is
+   * what makes the later parallel evolution reproducible across thread counts.
+   * Impact parameter sampling above is intentionally shared (drawn once from
+   * the live engine before ensemble 0 inherits it). */
+  ensemble_rng_.resize(parameters_.n_ensembles);
+  for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+    if (i_ens == 0) {
+      ensemble_rng_[0] = random::get_engine_state();
+    } else {
+      ensemble_rng_[i_ens].seed(random::derive_seed(event_master_seed, i_ens));
+    }
+    random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
+    start_time = modus_.initial_conditions(&ensembles_[i_ens], parameters_);
+    /* For box modus make sure that particles are in the box. In principle,
+     * after a correct initialization they should be, so this is just playing
+     * it safe. */
+    modus_.impose_boundary_conditions(&ensembles_[i_ens], outputs_);
   }
   // Reset the simulation clock
   double timestep = delta_time_startup_;
@@ -2141,6 +2270,8 @@ void Experiment<Modus>::initialize_new_event() {
   /* Save the initial conserved quantum numbers and total momentum in
    * the system for conservation checks */
   conserved_initial_ = QuantumNumbers(ensembles_);
+  // Reset the per-ensemble accumulators and the reduced scalar totals.
+  ens_scalars_.assign(parameters_.n_ensembles, EnsembleScalars{});
   wall_actions_total_ = 0;
   previous_wall_actions_total_ = 0;
   interactions_total_ = 0;
@@ -2259,10 +2390,14 @@ template <typename Modus>
 bool Experiment<Modus>::perform_action(Action &action, int i_ensemble,
                                        bool include_pauli_blocking) {
   Particles &particles = ensembles_[i_ensemble];
+  // Per-ensemble counters: written only for this ensemble, so updating them is
+  // safe inside the parallel-over-ensembles region (Phase 2). Reduced into the
+  // scalar totals later by sync_ensemble_counters().
+  EnsembleScalars &es = ens_scalars_[i_ensemble];
   auto &incoming = action.incoming_particles();
   // Make sure to skip invalid and Pauli-blocked actions.
   if (!action.is_valid(particles)) {
-    discarded_interactions_total_++;
+    es.discarded_interactions++;
     logg[LExperiment].debug(~einhard::DRed(), "✘ ", action,
                             " (discarded: invalid)");
     return false;
@@ -2294,7 +2429,7 @@ bool Experiment<Modus>::perform_action(Action &action, int i_ensemble,
   logg[LExperiment].debug("Process Type is: ", action.get_type());
   if (include_pauli_blocking && pauli_blocker_ &&
       action.is_pauli_blocked(ensembles_, *pauli_blocker_)) {
-    total_pauli_blocked_++;
+    es.pauli_blocked++;
     return false;
   }
 
@@ -2315,18 +2450,20 @@ bool Experiment<Modus>::perform_action(Action &action, int i_ensemble,
   }
 
   /* Make sure to pick a non-zero integer, because 0 is reserved for "no
-   * interaction yet". */
-  const auto id_process = static_cast<uint32_t>(interactions_total_ + 1);
+   * interaction yet". The id_process is per-ensemble (it counts interactions in
+   * this ensemble only), so particle process tags never entangle across
+   * ensembles in the parallel region. */
+  const auto id_process = static_cast<uint32_t>(es.interactions_total + 1);
   // we perform the action and collect possible energy violations by Pythia
-  total_energy_violated_by_Pythia_ += action.perform(&particles, id_process);
+  es.energy_violated_by_pythia += action.perform(&particles, id_process);
 
-  interactions_total_++;
+  es.interactions_total++;
   if (action.get_type() == ProcessType::Wall) {
-    wall_actions_total_++;
+    es.wall_actions++;
   }
   if (action.get_type() == ProcessType::Fluidization) {
-    total_hypersurface_crossing_actions_++;
-    total_energy_removed_ += action.incoming_particles()[0].momentum().x0();
+    es.hypersurface_crossings++;
+    es.energy_removed += action.incoming_particles()[0].momentum().x0();
   }
   // Calculate Eckart rest frame density at the interaction point
   double rho = 0.0;
@@ -2538,6 +2675,41 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
     throw std::logic_error(
         "Experiment cannot evolve the system beyond End_Time.");
   }
+  /* Phase 2 parallelization gates (constant across the run):
+   *  - action *finding* and *performing* over ensembles are now parallelized
+   *    even with strings on: each thread owns its own StringProcess/Pythia
+   *    (Phase 2 strings), and the per-ensemble Pythia reseeding keeps results
+   *    reproducible. With strings on the ensemble loops use a *static* schedule
+   *    (set below) so that the thread which finds an ensemble's actions is the
+   *    one that performs them, hence the only thread touching that thread's
+   *    Pythia;
+   *  - action *performing* is only parallelized when no output is written per
+   *    interaction, so such output stays deterministically ordered. When kept
+   *    serial the loop still runs correctly, just on one thread. The flags are
+   *    unused without OpenMP (the pragmas are no-ops).
+   */
+  [[maybe_unused]] const bool parallel_find = true;
+  [[maybe_unused]] const bool parallel_perform = !has_per_interaction_output_;
+#ifdef _OPENMP
+  /* Strings: pin ensembles to threads (static) so find-thread == perform-thread.
+   * No strings: dynamic schedule for better load balancing. Applies to the
+   * ensemble find/perform loops, which use schedule(runtime). */
+  omp_set_schedule(
+      parameters_.strings_switch ? omp_sched_static : omp_sched_dynamic, 0);
+#endif
+  /* Phase 3a: for a single big event the ensemble loop offers no parallelism,
+   * so instead distribute the (expensive) per-cell pair search over threads.
+   * Restricted to the geometric/covariant criteria without strings (the
+   * per-thread Pythia is keyed to the ensemble loop, not the cell loop); the
+   * per-cell results are merged in serial order and each task is given a
+   * deterministic RNG seed (for the decay-time sampling), so the result is
+   * bit-reproducible for any thread count. The stochastic criterion draws a
+   * random number per particle *pair* during finding and would need a
+   * counter-based RNG keyed by the pair to stay reproducible (a documented
+   * follow-on), so it keeps the serial cell search. */
+  [[maybe_unused]] const bool cell_parallel_find =
+      parameters_.n_ensembles == 1 && !parameters_.strings_switch &&
+      parameters_.coll_crit != CollisionCriterion::Stochastic;
   while (*(parameters_.labclock) < t_end) {
     const double dt = parameters_.labclock->timestep_duration();
     logg[LExperiment].debug("Timestepless propagation for next ", dt, " fm.");
@@ -2552,6 +2724,7 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
                                                ignore_cells_under_treshold);
       const double current_t = parameters_.labclock->current_time();
       for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+        random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
         thermalizer_->thermalize(ensembles_[i_ens], current_t,
                                  parameters_.testparticles);
         ThermalizationAction th_act(*thermalizer_, current_t);
@@ -2567,7 +2740,15 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
     }
 
     std::vector<Actions> actions(parameters_.n_ensembles);
+    /* (1) Parallel action finding over ensembles. Each iteration writes only
+     * actions[i_ens] and draws from its own RNG stream (ScopedEngine), so the
+     * iterations are independent. Dynamic schedule balances ensembles with
+     * uneven particle counts. When the cell-parallel path (Phase 3a) is taken
+     * the outer loop is kept serial (one ensemble) and the parallelism is moved
+     * inside, onto the grid cells, to avoid nested parallel regions. */
+#pragma omp parallel for schedule(runtime) if (parallel_find && !cell_parallel_find)
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+      random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
       actions[i_ens].clear();
       if (ensembles_[i_ens].size() > 0 && action_finders_.size() > 0) {
         /* (1.a) Create grid. */
@@ -2588,39 +2769,52 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
 
         const double gcell_vol = grid.cell_volume();
         /* (1.b) Iterate over cells and find actions. */
-        grid.iterate_cells(
-            [&](const ParticleList &search_list) {
-              for (const auto &finder : action_finders_) {
-                actions[i_ens].insert(finder->find_actions_in_cell(
-                    search_list, dt, gcell_vol, beam_momentum_));
-              }
-            },
-            [&](const ParticleList &search_list,
-                const ParticleList &neighbors_list) {
-              for (const auto &finder : action_finders_) {
-                actions[i_ens].insert(finder->find_actions_with_neighbors(
-                    search_list, neighbors_list, dt, beam_momentum_));
-              }
-            });
+        if (cell_parallel_find) {
+          find_actions_cell_parallel(grid, dt, gcell_vol, actions[i_ens]);
+        } else {
+          grid.iterate_cells(
+              [&](const ParticleList &search_list) {
+                for (const auto &finder : action_finders_) {
+                  actions[i_ens].insert(finder->find_actions_in_cell(
+                      search_list, dt, gcell_vol, beam_momentum_));
+                }
+              },
+              [&](const ParticleList &search_list,
+                  const ParticleList &neighbors_list) {
+                for (const auto &finder : action_finders_) {
+                  actions[i_ens].insert(finder->find_actions_with_neighbors(
+                      search_list, neighbors_list, dt, beam_momentum_));
+                }
+              });
+        }
       }
     }
 
     /* \todo (optimizations) Adapt timestep size here */
 
-    /* (2) Propagate from action to action until next output or timestep end */
+    /* (2) Propagate from action to action until next output or timestep end.
+     * Performing mutates per-ensemble particles and counters only; the reduced
+     * scalar totals are refreshed by sync_ensemble_counters() before any code
+     * (intermediate_output, reporting) reads them. */
     const double end_timestep_time = parameters_.labclock->next_time();
     while (next_output_time() < end_timestep_time) {
+#pragma omp parallel for schedule(runtime) if (parallel_perform)
       for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+        random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
         run_time_evolution_timestepless(actions[i_ens], i_ens,
                                         next_output_time());
       }
+      sync_ensemble_counters();
       ++(*parameters_.outputclock);
 
       intermediate_output();
     }
+#pragma omp parallel for schedule(runtime) if (parallel_perform)
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+      random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
       run_time_evolution_timestepless(actions[i_ens], i_ens, end_timestep_time);
     }
+    sync_ensemble_counters();
 
     /* (3) Update potentials (if computed on the lattice) and
      *     compute new momenta according to equations of motion */
@@ -2701,12 +2895,88 @@ inline void check_interactions_total(uint64_t interactions_total) {
 }
 
 template <typename Modus>
+template <typename G>
+void Experiment<Modus>::find_actions_cell_parallel(const G &grid, double dt,
+                                                   double gcell_vol,
+                                                   Actions &out) {
+  /* A unit of work: the pair/multi-particle search within a search cell, or
+   * between a search cell and one neighbor cell. The particle lists are copied
+   * because the periodic-boundary grid hands the callbacks temporaries (with
+   * wrapped positions); the copies must outlive the parallel region below.
+   * Copying is O(particles-per-cell), negligible against the O(N^2) search. */
+  struct FindTask {
+    ParticleList search;
+    ParticleList neighbors;
+    bool is_neighbor;
+  };
+  std::vector<FindTask> tasks;
+  /* Collect the work items in the exact serial cell-iteration order, so the
+   * later merge reproduces the serial insertion order into the action heap. */
+  grid.iterate_cells(
+      [&](const ParticleList &search_list) {
+        tasks.push_back(FindTask{search_list, ParticleList{}, false});
+      },
+      [&](const ParticleList &search_list,
+          const ParticleList &neighbors_list) {
+        tasks.push_back(FindTask{search_list, neighbors_list, true});
+      });
+
+  /* Some finders draw random numbers during finding — notably the decay finder,
+   * which samples each resonance's decay time. To keep the result independent
+   * of how the cells are distributed over threads, draw a single base seed from
+   * the ensemble's own stream and seed each task's RNG deterministically from
+   * (base_seed, task index). The ensemble engine (currently swapped into the
+   * thread-local engine by the caller's ScopedEngine) is thereby advanced by
+   * exactly one draw, keeping the subsequent performing phase deterministic.
+   * Worker threads re-seed their own thread-local engines per task, so we save
+   * and restore the ensemble state around the parallel region. */
+  const uint64_t base_seed = random::advance();
+  const random::Engine ensemble_state = random::get_engine_state();
+
+  std::vector<ActionList> results(tasks.size());
+#pragma omp parallel for schedule(dynamic)
+  for (size_t t = 0; t < tasks.size(); t++) {
+    const FindTask &task = tasks[t];
+    // Deterministic, order-independent RNG stream for this task.
+    random::set_seed(random::derive_seed(base_seed, t + 1));
+    ActionList &local = results[t];
+    for (const auto &finder : action_finders_) {
+      ActionList found =
+          task.is_neighbor
+              ? finder->find_actions_with_neighbors(task.search, task.neighbors,
+                                                    dt, beam_momentum_)
+              : finder->find_actions_in_cell(task.search, dt, gcell_vol,
+                                             beam_momentum_);
+      local.insert(local.end(), std::make_move_iterator(found.begin()),
+                   std::make_move_iterator(found.end()));
+    }
+  }
+  // Restore the ensemble stream (the worker re-seeds clobbered the thread-local
+  // engine); the caller's ScopedEngine then swaps this back into ensemble_rng_.
+  random::set_engine_state(ensemble_state);
+
+  // Merge in task (serial cell-iteration) order for a deterministic heap.
+  for (ActionList &r : results) {
+    out.insert(std::move(r));
+  }
+}
+
+template <typename Modus>
 void Experiment<Modus>::run_time_evolution_timestepless(
     Actions &actions, int i_ensemble, const double end_time_propagation) {
   Particles &particles = ensembles_[i_ensemble];
   logg[LExperiment].debug(
       "Timestepless propagation: ", "Actions size = ", actions.size(),
       ", end time = ", end_time_propagation);
+
+  /* Reseed this thread's Pythia from the current ensemble's RNG stream (the
+   * caller wraps this in a ScopedEngine for ensemble i_ensemble). This makes the
+   * string fragmentation a deterministic function of the ensemble index, so the
+   * parallel-strings result is reproducible for any thread count. No-op when
+   * strings are off. */
+  for (const auto &finder : action_finders_) {
+    finder->reseed_string_process();
+  }
 
   // iterate over all actions
   while (!actions.is_empty()) {
@@ -2716,7 +2986,7 @@ void Experiment<Modus>::run_time_evolution_timestepless(
     // get next action
     ActionPtr act = actions.pop();
     if (!act->is_valid(particles)) {
-      discarded_interactions_total_++;
+      ens_scalars_[i_ensemble].discarded_interactions++;
       logg[LExperiment].debug(~einhard::DRed(), "✘ ", act,
                               " (discarded: invalid)");
       continue;
@@ -2758,7 +3028,7 @@ void Experiment<Modus>::run_time_evolution_timestepless(
           outgoing_particles, particles, time_left, beam_momentum_));
     }
 
-    check_interactions_total(interactions_total_);
+    check_interactions_total(ens_scalars_[i_ensemble].interactions_total);
   }
 
   propagate_and_shine(end_time_propagation, particles);
@@ -2933,6 +3203,11 @@ void Experiment<Modus>::update_potentials() {
                      density_param_, ensembles_,
                      parameters_.labclock->timestep_duration(), true);
       const size_t UBlattice_size = UB_lat_->size();
+      /* Per-node potential/force computation: each node is independent (it only
+       * reads its own jmu and writes its own U/F entries), so this O(N_nodes)
+       * loop — a dominant mean-field cost on fine lattices — is parallelized
+       * byte-identically (no reduction, no RNG, no root solver here). */
+#pragma omp parallel for schedule(static)
       for (size_t i = 0; i < UBlattice_size; i++) {
         auto jB = (*jmu_B_lat_)[i];
         const FourVector flow_four_velocity_B =
@@ -2968,6 +3243,10 @@ void Experiment<Modus>::update_potentials() {
       update_lattice_accumulating_ensembles(
           jmu_el_lat_.get(), LatticeUpdate::EveryTimestep, DensityType::Charge,
           density_param_, ensembles_, true);
+      /* Coulomb E/B field: each node integrates over a volume independently —
+       * the single most expensive per-node loop when Coulomb is on. Byte-identical
+       * to parallelize (per-node writes, read-only lattice). */
+#pragma omp parallel for schedule(static)
       for (size_t i = 0; i < EM_lat_->size(); i++) {
         ThreeVector electric_field = {0., 0., 0.};
         ThreeVector position = jmu_el_lat_->cell_center(i);
@@ -2995,6 +3274,9 @@ void Experiment<Modus>::update_potentials() {
             parameters_.labclock->timestep_duration());
       }
       const size_t UBlattice_size = UB_lat_->size();
+      /* Per-node VDF potential/force: independent per node, parallelized
+       * byte-identically. */
+#pragma omp parallel for schedule(static)
       for (size_t i = 0; i < UBlattice_size; i++) {
         auto jB = (*jmu_B_lat_)[i];
         (*UB_lat_)[i] = potentials_->vdf_pot(jB.rho(), jB.jmu_net());
@@ -3021,11 +3303,25 @@ void Experiment<Modus>::do_final_interactions() {
   /* At end of time evolution: Force all resonances to decay. In order to handle
    * decay chains, we need to loop until no further actions occur. */
   bool actions_performed, actions_found;
-  uint64_t interactions_old;
+  [[maybe_unused]] const bool parallel_perform =
+      !parameters_.strings_switch && !has_per_interaction_output_;
+  sync_ensemble_counters();
   do {
     actions_found = false;
-    interactions_old = interactions_total_;
+    const uint64_t interactions_before = interactions_total_;
+    /* The per-ensemble loop is independent (each touches only ensemble i_ens
+     * and its own RNG stream); parallelized under the same gate as performing.
+     * actions_found is OR-reduced across threads. */
+#pragma omp parallel for schedule(dynamic) if (parallel_perform) \
+    reduction(|| : actions_found)
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+      random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
+      // Reseed this thread's Pythia from the ensemble's stream (see
+      // run_time_evolution_timestepless); here finding and performing happen in
+      // the same iteration, so the same thread owns and uses its StringProcess.
+      for (const auto &finder : action_finders_) {
+        finder->reseed_string_process();
+      }
       Actions actions;
       // Dileptons: shining of remaining resonances
       if (dilepton_finder_ != nullptr) {
@@ -3046,7 +3342,8 @@ void Experiment<Modus>::do_final_interactions() {
         perform_action(*actions.pop(), i_ens, false);
       }
     }
-    actions_performed = interactions_total_ > interactions_old;
+    sync_ensemble_counters();
+    actions_performed = interactions_total_ > interactions_before;
     // Throw an error if actions were found but not performed
     if (actions_found && !actions_performed) {
       throw std::runtime_error("Final actions were found but not performed.");

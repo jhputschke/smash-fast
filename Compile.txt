@@ -1,0 +1,9 @@
+cmake .. \
+-DCMAKE_PREFIX_PATH=/home/putschke/miniconda3/envs/js_fno \
+-DPythia_INCLUDE_DIR=/home/putschke/JetScape/smash-fast/pythia8316/include \
+-DPythia_LIBRARY=/home/putschke/JetScape/smash-fast/pythia8316/lib/libpythia8.a \
+-DPythia_XMLDOC_DIR=/home/putschke/JetScape/smash-fast/pythia8316/share/Pythia8/xmldoc
+
+and 
+
+export PYTHIA8DATA=/home/putschke/JetScape/smash-fast/pythia8316/share/Pythia8/xmldoc

@@ -16,7 +16,20 @@
 
 namespace smash {
 static constexpr int LGrandcanThermalizer = LogArea::GrandcanThermalizer::id;
-/*thread_local (see #3075)*/ random::Engine random::engine;
+thread_local random::Engine random::engine;
+
+uint64_t random::derive_seed(uint64_t master_seed, uint64_t index) {
+  if (index == 0) {
+    // Preserve the legacy single-stream sequence for one-ensemble runs.
+    return master_seed;
+  }
+  // SplitMix64: mix the master seed with the stream index to obtain a
+  // statistically independent seed that depends only on (master_seed, index).
+  uint64_t z = master_seed + index * 0x9E3779B97F4A7C15ULL;
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
 
 int64_t random::generate_63bit_seed() {
   std::random_device rd;

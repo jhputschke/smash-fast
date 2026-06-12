@@ -17,6 +17,8 @@
 #include "smash/inputfunctions.h"
 #include "smash/isoparticletype.h"
 #include "smash/logging.h"
+#include "smash/parametrizations.h"
+#include "smash/particletype.h"
 #include "smash/setup_particles_decaymodes.h"
 #include "smash/stringfunctions.h"
 
@@ -82,6 +84,20 @@ void tabulate_resonance_integrals(const sha256::Hash &hash,
     logg[LMain].info() << "Tabulations path: " << tabulations_path;
   }
   IsoParticleType::tabulate_integrals(hash, tabulations_path);
+}
+
+void warm_up_resonance_caches() {
+  /* Phase 0 of the parallelization plan: force all lazily initialized, then
+   * read-only resonance and parametrization caches to be built now, serially.
+   * The cross-section integrals are cached on disk and therefore
+   * short-circuited on a cache hit, which would otherwise leave the
+   * spectral-function normalizations and decay-width tabulations to be filled
+   * in lazily during the (later, possibly multi-threaded) time evolution.
+   * Warming them here keeps them read-only in the parallel region. This is a
+   * pure warm-up and does not change any simulation results. */
+  logg[LMain].info("Warming up resonance and parametrization caches...");
+  ParticleType::initialize_lazy_caches();
+  kaon_nucleon_ratios.ensure_initialized();
 }
 
 static Configuration create_configuration(

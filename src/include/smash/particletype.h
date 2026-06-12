@@ -447,6 +447,20 @@ class ParticleType {
    */
   static const ParticleTypeList &list_all();
 
+  /**
+   * Pre-compute (serially) all lazily-initialized resonance caches.
+   *
+   * Two pieces of resonance data are otherwise computed lazily on first use:
+   * the spectral-function normalization factor (ParticleType::norm_factor_,
+   * via a shared static GSL Integrator) and the decay-width tabulations
+   * (DecayType::rho(), some via a 2D GSL integrator). Touching them from
+   * several threads at once would be a data race (see issue #3075). Calling
+   * this function once at start-up forces all of them to be built on a single
+   * thread, after which they are only ever read. This is a pure warm-up:
+   * the numerical results of a simulation are unaffected.
+   */
+  static void initialize_lazy_caches();
+
   /// \return a list of all nucleons (i.e. proton and neutron).
   static ParticleTypePtrList &list_nucleons();
   /// \return a list of all anti-nucleons (i.e. anti-proton and anti-neutron).
