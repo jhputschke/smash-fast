@@ -453,6 +453,31 @@ double ParticleType::total_width(const double m) const {
   return w;
 }
 
+void ParticleType::initialize_lazy_caches() {
+  for (const ParticleType &t : list_all()) {
+    if (t.is_stable()) {
+      continue;
+    }
+    /* Warm the spectral-function normalization factor (norm_factor_), which is
+     * otherwise computed lazily through a shared static Integrator on first
+     * use. */
+    t.spectral_function(t.mass());
+    /* Warm all decay-width tabulations (DecayType::rho()), which are otherwise
+     * built lazily (some through a 2D GSL integrator) on first use.
+     * ParticleType::partial_width() skips modes below their threshold, so the
+     * total width is evaluated on a mass grid wide enough to cross every
+     * decay-channel threshold and thereby trigger every tabulation. */
+    const double m_min = t.min_mass_kinematic();
+    const double m_max = t.mass() + 20.0 * t.width_at_pole() + 2.0;
+    constexpr int n_grid = 5;
+    for (int i = 0; i < n_grid; ++i) {
+      const double m = m_min + (m_max - m_min) * i / (n_grid - 1);
+      t.total_width(m);
+      t.spectral_function(m);
+    }
+  }
+}
+
 void ParticleType::check_consistency() {
   for (const ParticleType &ptype : ParticleType::list_all()) {
     if (!ptype.is_stable() && ptype.decay_modes().is_empty()) {

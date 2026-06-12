@@ -682,6 +682,12 @@ int main(int argc, char *argv[]) {
     const auto hash =
         initialize_particles_decays_and_return_hash(configuration, version);
 
+    /* Warm up all lazy resonance/parametrization caches serially before the
+     * Experiment is created, so that they are read-only during the (possibly
+     * multi-threaded) evolution and so that this one-time cost is not counted
+     * as part of the reported evolution time. */
+    warm_up_resonance_caches();
+
     // Create an experiment
     logg[LMain].trace(SMASH_SOURCE_LOCATION, " create Experiment");
     auto experiment = ExperimentBase::create(configuration, output_path);

@@ -72,6 +72,19 @@ sha256::Hash initialize_particles_decays_and_return_hash(
  */
 void tabulate_resonance_integrals(const sha256::Hash &hash,
                                   const std::string &tabulations_dir);
+
+/**
+ * Pre-compute all lazily-initialized, then read-only resonance and
+ * parametrization caches serially (Phase 0 of the parallelization plan).
+ *
+ * This must be called once, after the particle list and decay modes have been
+ * loaded and before any (possibly multi-threaded) time evolution starts. It
+ * forces the spectral-function normalizations, decay-width tabulations and the
+ * K N isospin-ratio cache to be built on a single thread, so that they remain
+ * read-only inside the parallel region. It is a pure warm-up and does not
+ * change any simulation results.
+ */
+void warm_up_resonance_caches();
 }  // namespace smash
 
 #endif  // SRC_INCLUDE_SMASH_LIBRARY_H_

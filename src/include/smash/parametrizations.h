@@ -568,6 +568,16 @@ class KaonNucleonRatios {
    */
   double get_ratio(const ParticleType& a, const ParticleType& b,
                    const ParticleType& c, const ParticleType& d) const;
+
+  /**
+   * Pre-compute the isospin ratios (serial warm-up).
+   *
+   * This forces the otherwise lazy, first-use initialization of the cache to
+   * happen now, so that the cache stays read-only inside later multi-threaded
+   * regions (see Phase 0 of the parallelization plan). Pure warm-up: the
+   * numerical results are unchanged.
+   */
+  void ensure_initialized() const;
 };
 
 extern /*thread_local (see #3075)*/ KaonNucleonRatios kaon_nucleon_ratios;
