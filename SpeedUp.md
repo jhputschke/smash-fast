@@ -294,13 +294,26 @@ it is a research-grade follow-on, not a quick win:
   for strings), and the thread-safety has to be made FP-neutral.
 - **(b)** a naive parallel momentum loop (with (a)) runs but gives only **~1.24×**
   and is not bit-reproducible.
-- **(c)** is the actual lever: `update_lattice_accumulating_ensembles` sums every
-  ensemble into one shared lattice serially, which dominates the step. It needs
-  per-thread partial lattices reduced node-wise (memory ×N_threads + a reduction).
+- **(c)** is the dominant cost: `update_lattice_accumulating_ensembles` sums every
+  ensemble into one shared lattice serially. It was implemented — give each
+  ensemble its own partial lattice (`DensityOnLattice`/`ThermLatticeNode` got an
+  `operator+=`), fill them in parallel, and sum node-wise in ensemble order. But
+  it is **counter-productive for realistic lattices**: the smearing is a
+  *scatter* (each particle touches only a few nodes), so the reduction cost
+  scales with the *node count*, not the particle count. For the standard
+  potentials config (80³ = 5×10⁵ nodes, 20 ensembles) the per-step reduction is
+  ~10⁷ node-adds — more work than the smearing it parallelizes — plus a ~2.3 GB
+  partial-lattice allocation every step. Measured: the first time step alone took
+  **85 s** versus ~30 s for the entire serial run. A viable (c) needs a
+  *gather*-based (node-parallel) rewrite of the smearing with a spatial particle
+  index — i.e. a different algorithm, not a wrapper — which is research-grade.
 
 The clean committed state keeps the mean-field momentum/lattice updates serial
-(correct, reproducible). The strings follow-on, by contrast, **is implemented** —
-see "Phase 2 strings" below.
+(correct, reproducible). **Conclusion: a real mean-field speedup is research-grade
+on all three counts** — FP-neutral thread-safe force evaluation (a), a parallel
+momentum loop (b), and a re-architected node-parallel lattice fill (c) — and is
+left as documented future work. The strings follow-on, by contrast, **is
+implemented** — see "Phase 2 strings" below.
 
 ### Phase 2 strings — per-thread Pythia
 
