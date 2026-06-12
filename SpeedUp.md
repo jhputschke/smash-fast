@@ -423,4 +423,53 @@ discrete-GPU host. General heavy-ion-with-strings remains CPU+OpenMP territory
 (Phase 2). The prototype proves both halves concretely: the kernels are
 **correct and reproducible**, and the transfer wall is **real**.
 
+---
+
+## Summary
+
+| Phase | What | Status | Headline result |
+|---|---|---|---|
+| 0 | Serial warm-up of lazy resonance caches | ✅ | enabler; stochastic byte-identical, covariant conserves to ≤2e-8 |
+| 1 | thread_local RNG + per-ensemble seeding | ✅ | 1-ensemble byte-identical; reproducible by construction |
+| 2 | OpenMP over ensembles | ✅ | **3.3× (4t), 5.5–6.5× (8t)**, bit-identical across thread counts |
+| 3a | Cell-parallel finding (single big event) | ✅ | **3.9× (8t)**, bit-identical across thread counts |
+| 4 | GPU prototype (propagation + stochastic finding) | ✅ | GPU == CPU exactly; transfer-bound (0.5–0.6× incl. copy) |
+
+**The deliverable.** Ensemble-level OpenMP (Phase 2) is the headline: for the
+no-strings, many-ensemble case — a large fraction of production runs — SMASH now
+scales near-linearly up to the ensemble count, **bit-for-bit reproducibly for any
+thread count** (the test issue #3075 failed). Phases 0–1 are the enablers that
+made this safe (warmed caches, per-ensemble deterministic RNG, a fixed
+Clebsch-Gordan race). Phase 3a extends parallelism to the single-big-event
+regime. Phase 4 shows, with a verified prototype, that the GPU helps only for the
+narrow box+stochastic+device-resident corner.
+
+**Correctness, restated.** Every threaded phase was validated by the strongest
+applicable check: single-ensemble runs are **byte-identical** to the original
+serial output; multi-ensemble and single-big-event runs are **byte-identical
+across `OMP_NUM_THREADS = 1/2/4/8`**; energy/momentum/charge/baryon number are
+conserved throughout (the box configs enforce this every time step and never
+tripped); the GPU kernels reproduce the CPU result exactly.
+
+**Scoped follow-ons (per the plan, not done here).** Phase 2 strings
+(per-thread Pythia); the mean-field speedup (thread-safe force evaluation +
+parallel `update_momenta` + per-thread partial-lattice reduction); stochastic
+Phase 3a (counter-based pair RNG, prototyped on the GPU); Phase 3b domain
+decomposition; full GPU integration with device-resident SoA data. A
+ThreadSanitizer pass would also formalize the one remaining benign same-value
+race noted under Phase 2.
+
+## Reproducing the measurements
+
+```bash
+export PYTHIA8DATA=$PWD/pythia8316/share/Pythia8/xmldoc
+# reproducibility + strong scaling (md5 constant across threads = reproducible):
+bash verify/scaling.sh demo input/box/config.yaml 8 20.0 1 2 4 8
+# single big event (Phase 3a):
+bash verify/scaling.sh demo3a verify/box_heavy.yaml 1 20.0 1 2 4 8
+# GPU prototype:
+cd gpu && make run
+```
+
+
 
