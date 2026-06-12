@@ -159,6 +159,19 @@ and it might be useful to redirect warnings and error messages, that will still 
 ```
 
 
+## Parallelization and reproducibility
+
+SMASH is parallelized with OpenMP (over ensembles, the Pythia string routine, and the mean-field lattice). The number of threads is controlled the usual way, e.g.
+```console
+OMP_NUM_THREADS=8 ./smash -i ../input/config.yaml
+```
+If `OMP_NUM_THREADS` is left **unset**, OpenMP defaults to the number of hardware threads on the machine.
+
+For runs **with mean-field potentials**, the density smearing switches from the serial *scatter* to a node-parallel *gather* (a cell-list reformulation that is race-free and GPU-friendly) once at least 4 threads are available; below that, and when built without OpenMP, the cheaper serial scatter is used. The gather reproduces the same particle/node contributions as the scatter; it only changes the order in which each lattice node accumulates them.
+
+Because the mean-field collider is floating-point chaotic, **multi-threaded potential runs are not byte-for-byte identical to the serial run** (results differ at the ~1 ULP level and the chaotic force feedback amplifies it). This is true of the OpenMP parallelism in general, not just the gather, and is physically benign: **conserved quantities are preserved** — net charge exactly, total energy in average (mean fields conserve energy only on average) — and multiplicities agree within √N. To obtain byte-identical output (e.g. for regression tests), **pin the thread count**, for instance `OMP_NUM_THREADS=1`; at fewer than 4 threads the mean-field path also uses the serial scatter, so single-thread output is reproducible. Validate multi-threaded potential runs by conservation, not by byte-identity. See `MeanField.md` and `SpeedUp.md` for the detailed measurements and rationale.
+
+
 ## License
 
 Different licenses apply to different files:
