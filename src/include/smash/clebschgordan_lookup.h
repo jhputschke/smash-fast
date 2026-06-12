@@ -188,8 +188,16 @@ class ClebschGordan {
   /**
    * Tabulation of Clebsch-Gordan coefficients. The C++ code to produce this
    * member declaration can be found in the "tabulate" unit test of this file.
+   *
+   * It is thread_local because ClebschGordan::coefficient() lazily inserts any
+   * coefficient missing from the pre-filled table; a shared table would suffer
+   * a concurrent-insert data race in the parallel action-finding region
+   * (Phase 2/3a). The coefficients are deterministic (GSL Wigner-3j), so every
+   * thread fills its own copy with identical values and results stay
+   * reproducible. The map is small, so the per-thread duplication is cheap.
    */
-  inline static std::unordered_map<ThreeSpins, double, ThreeSpinHash>
+  inline static thread_local std::unordered_map<ThreeSpins, double,
+                                                ThreeSpinHash>
       lookup_table = {
           {{0, 0, 0, +0, +0, +0}, 1.00000000000000000},
           {{0, 1, 1, +0, -1, -1}, 1.00000000000000022},

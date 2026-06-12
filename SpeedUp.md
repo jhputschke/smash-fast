@@ -270,4 +270,129 @@ flagged by ThreadSanitizer; warming those pointers in Phase 0 (or making them
 `std::atomic`) is a clean follow-up together with the per-thread-Pythia work
 needed to parallelize the strings path.
 
+**Thread-safety fix found during verification.** The Clebsch-Gordan coefficient
+cache (`ClebschGordan::lookup_table`) lazily *inserts* any coefficient missing
+from its pre-filled table. Concurrently inserting into the shared cache from the
+parallel finding region is a data race; it was made `thread_local` (the values
+are deterministic GSL Wigner-3j, so each thread fills its own copy identically).
+This removes a latent race that the ensemble-parallel runs happened not to
+trigger but the finer-grained cell-parallel runs (Phase 3a) did.
+
+## Phase 3a — Parallel action finding over grid cells
+
+**Goal:** for a *single big event* (`Ensembles: 1`), where the ensemble loop of
+Phase 2 offers no parallelism, distribute the expensive per-cell pair search
+over threads instead.
+
+**What changed** (`experiment.h`)
+
+- New `find_actions_cell_parallel()`: collects the grid's per-cell work items
+  (search cells and neighbor-cell pairs) in the serial cell-iteration order,
+  runs the O(N²) pair search of each item **in parallel** (`#pragma omp parallel
+  for`), stores results indexed by work item, and merges them back in order.
+- The finding loop now takes this path when `cell_parallel_find` holds:
+  one ensemble, OpenMP, no strings, and a non-stochastic criterion. The outer
+  ensemble loop is then kept serial so the parallelism lives on the cells (no
+  nested regions).
+
+**Reproducibility despite finding-time RNG.** The decay finder samples each
+resonance's decay time *during finding* (`decayactionsfinder.cc`). To keep the
+result independent of the cell→thread schedule, `find_actions_cell_parallel`
+draws one base seed from the ensemble's own stream and seeds each work item's RNG
+deterministically from `(base_seed, item index)`; the ensemble engine is advanced
+by exactly that one draw, so the performing phase stays deterministic. This makes
+the outcome **bit-reproducible for any thread count** (it is not identical to the
+serial cell order, because the decay-time stream is re-keyed per item — the same
+trade-off, and the same counter-based-RNG idea, as Phase 1 multi-ensemble).
+
+**Stochastic criterion** draws a random number per particle *pair* during
+finding; reproducing that under cell parallelism needs a counter-based RNG keyed
+by the pair (demonstrated in the Phase 4 GPU prototype). Until that is wired into
+the CPU finder, the stochastic criterion keeps the serial cell search.
+
+**A latent race was fixed here:** see the Clebsch-Gordan `thread_local` note
+above — the finer-grained cell parallelism is what exposed it.
+
+**Verification** (heavier hadron-gas box, L=12 fm, **1 ensemble**):
+
+| Threads | Evol [s] | Speedup | Reproducible |
+|---|---|---|---|
+| 1 | 0.98 | 1.00× | — |
+| 2 | 0.60 | 1.65× | ✅ (`1a2ac644…`) |
+| 4 | 0.37 | 2.66× | ✅ (`1a2ac644…`) |
+| 8 | 0.25 | 3.91× | ✅ (`1a2ac644…`) |
+
+Identical md5 across all thread counts (the #3075 acceptance test); the
+per-timestep conservation check passed throughout (initial conditions are
+sampled before finding, so total energy/charge are identical to a serial run and
+preserved to SMASH's tolerance). This complements Phase 2: ensemble parallelism
+for many ensembles, cell parallelism for one big event.
+
+<!-- PHASE3A -->
+
+
+## Phase 4 — GPU targeted kernels (prototype + honest assessment)
+
+**Goal:** determine, with a working and verified prototype, whether the
+GPU-viable corner of SMASH (propagation; stochastic-criterion box finding) is
+actually worth offloading, and under what conditions.
+
+This machine has a CUDA 13 toolkit and an NVIDIA **GB10** (Grace-Blackwell)
+GPU with coherent unified memory, so Phase 4 is a real prototype, not paper.
+
+**What was built** — `gpu/smash_gpu_prototype.cu` (standalone, not linked into
+SMASH; full integration into SMASH's AoS `ParticleData` is the research-grade
+step the plan flags). It implements the two genuinely GPU-viable kernels on a
+structure-of-arrays particle layout and checks them against a CPU reference:
+
+1. **Propagation** `x += v*dt` — one thread per particle.
+2. **Stochastic 2->2 finding** in a box — one thread per intra-cell pair, using
+   exactly SMASH's rule `prob = xs * v_rel * dt / cell_volume`, colliding when a
+   uniform draw `<= prob`.
+
+The key enabler is a **counter-based RNG** (a stateless SplitMix64 hash of
+`(cell, i, j, step)`): the random number for a pair is independent of thread
+order, so CPU and GPU draw the *same* number for the *same* pair. This is the
+device-side analogue of the Phase-1 per-ensemble seeding, and the same
+ingredient a future stochastic Phase 3a would use.
+
+**Verification** (`./smash_gpu_prototype 64 24`, ~885k particles, ~28M pairs):
+
+| Check | Result |
+|---|---|
+| Propagation, max \|GPU−CPU\| position | **0.0 — bit-identical** |
+| Stochastic finding, collision count | 26 455 766 (GPU) == 26 455 766 (CPU) |
+| Stochastic finding, per-pair decision mismatches | **0 / 27 869 184 — identical** |
+
+So the GPU-viable physics is reproduced **exactly** on the GPU.
+
+**Timing — and the honest verdict.** Comparing the GPU against the *already
+parallel* 20-thread CPU (the fair baseline after Phase 2):
+
+| Size | CPU (20 thr) | GPU kernels | GPU H2D | GPU D2H | kernel-only | incl. transfer |
+|---|---|---|---|---|---|---|
+| 320k part / 6.2M pairs | 2.89 ms | 1.06 ms | 0.39 ms | 3.46 ms | 2.7× | **0.6×** |
+| 885k part / 28M pairs | 8.49 ms | 4.07 ms | 0.89 ms | 11.8 ms | 2.1× | **0.5×** |
+
+This is exactly the wall the analysis predicted:
+
+- The kernels beat 20 CPU threads only modestly (~2–3×): the work is cheap and
+  **memory-bound**, not compute-bound, so the GPU's arithmetic advantage is
+  largely wasted.
+- Once the host↔device **transfer** of the result is included, the GPU is
+  *slower than the CPU* (0.5–0.6×). The device-to-host copy dominates.
+
+**Verdict (matches the plan).** A *partial* offload of the cheap physics is not
+worth it — it is transfer-bound, because the expensive physics (cross sections,
+strings, the time-ordered action heap) must stay on the CPU, so data ping-pongs
+every step. The GPU is only worth it for the narrow **box + stochastic +
+no-strings + lattice-density** configuration **with device-resident data** (no
+per-step transfers), where the kernels' 2–3× (and more with a better-tuned
+finding kernel) would actually be realized. GB10's coherent memory softens but
+does not remove the transfer cost (the explicit D2H here still dominates); it
+makes the device-resident, zero-copy design more attractive than on a
+discrete-GPU host. General heavy-ion-with-strings remains CPU+OpenMP territory
+(Phase 2). The prototype proves both halves concretely: the kernels are
+**correct and reproducible**, and the transfer wall is **real**.
+
 
