@@ -1,0 +1,34 @@
+Logging:
+    default: INFO
+
+General:
+    Modus:         Box
+    Time_Step_Mode: Fixed
+    Delta_Time:    0.1
+    End_Time:      20.0
+    Randomseed:    12345
+    Nevents:       1
+
+Output:
+    Output_Interval: 20.0
+    Particles:
+        Format:          ["Oscar2013"]
+        Only_Final:      Yes
+
+Modi:
+    Box:
+        Length: 12.0
+        Temperature: 0.15
+        Initial_Condition: "thermal momenta"
+        Start_Time: 0.0
+        Use_Thermal_Multiplicities: True
+
+Collision_Term:
+    Collision_Criterion: "Covariant"
+    Maximum_Cross_Section: 750
+    Force_Decays_At_End: False
+    Strings: False
+    NNbar_Treatment: "resonances"
+    Elastic_NN_Cutoff_Sqrts: 1.8
+    Total_Cross_Section_Strategy: "BottomUp"
+    Pseudoresonance: "None"

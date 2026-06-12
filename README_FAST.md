@@ -114,7 +114,7 @@ Pythia 8.316; "evolution time" excludes the one‑time serial cache warm‑up):
 | **`Strings: True`, `Ensembles` ≥ threads, high √s** (strings actually fire) | per‑thread Pythia; parallel find **and** perform, static schedule (find‑thread = perform‑thread) | 1.35× (2t), ~2× (8t) | the **only** strings‑on case that speeds up; grows with #ensembles and string fraction. `verify/strings_collider.yaml` (O+O, √sₙₙ=17.3 GeV, 4 ens), `verify/strings_heavy.yaml` (Au+Au, 8 ens) |
 | **`Strings: True`, `Ensembles: 1`** *or* **low‑energy Collider** (strings never fire) | nothing parallelizes — one ensemble = no work to split, yet `OMP_NUM_THREADS` Pythia instances are still built; the strings flag also **disables** the cell‑parallel finder | **< 1× (slower than 1 thread)** | the common trap, e.g. Au+Au at `E_Kin: 1.23` GeV. Fix: set `Strings: False` (physically identical at that energy) and/or raise `Ensembles` — see callout below |
 | **`Ensembles: 1`, `Strings: False`, non‑stochastic criterion** | cell‑parallel pair search | 1.65× (2t), 2.66× (4t), 3.9× (8t) | `verify/box_heavy.yaml` with 1 ensemble |
-| **`Potentials:` (mean field)** | tabulated root‑find (deterministic) + **gather density fill for ≥ 4 threads** + node‑parallel force loops | 1.13× (1t, tabulation only), 1.54× (4t), **2.43× (8t)** | `input/potentials`, `verify/potentials_nomd.yaml`, `verify/md_on/config.yaml` |
+| **`Potentials:` (mean field)** | tabulated root‑find (deterministic) + **gather density fill for ≥ 4 threads** + node‑parallel force loops | 1.13× (1t, tabulation only), 1.54× (4t), **2.43× (8t)** | `input/potentials`, `verify/potentials_nomd.yaml`, `verify/potentials_md.yaml` |
 
 Key mean‑field detail: the density smearing switches from the serial **scatter**
 to the node‑parallel **gather** only when **≥ 4 threads** are available (the
@@ -208,7 +208,7 @@ re‑derived. The small ones are reproduced here; the rest are in `input/` and
 | `strings` | [verify/strings_collider.yaml](verify/strings_collider.yaml) | Collider, O+O, √sₙₙ=17.3 GeV | **yes** | moderate strings (per‑thread Pythia) |
 | `strings_heavy` | [verify/strings_heavy.yaml](verify/strings_heavy.yaml) | Collider, Au+Au, √sₙₙ=17.3 GeV | **yes** | heavy strings (string‑dominated runtime) |
 | `potentials` | [input/potentials/config.yaml](input/potentials/config.yaml) | Collider, Cu+Cu, Skyrme + symmetry, 80³ lattice | no | mean‑field scatter→gather, force loops |
-| `potentials_md` | [verify/md_on/config.yaml](verify/md_on/config.yaml) | as above **+ momentum dependence** | no | mean‑field tabulation + gather (the 2.4× case) |
+| `potentials_md` | [verify/potentials_md.yaml](verify/potentials_md.yaml) | as above **+ momentum dependence** | no | mean‑field tabulation + gather (the 2.4× case) |
 | `potentials_nomd` | [verify/potentials_nomd.yaml](verify/potentials_nomd.yaml) | as `potentials`, no momentum dependence | no | mean‑field floor reference |
 
 Representative small configs, inline:
@@ -237,9 +237,9 @@ Modi:
 Collision_Term: { Strings: True, Collision_Criterion: "Covariant" }
 ```
 
-**`verify/potentials_nomd.yaml` / `verify/md_on/config.yaml`** — Cu+Cu at
+**`verify/potentials_nomd.yaml` / `verify/potentials_md.yaml`** — Cu+Cu at
 E_kin = 1.23 GeV, 20 ensembles, 80³ lattice, Skyrme + symmetry potentials
-(`md_on` adds `Momentum_Dependence: { C: -63.1…, Lambda: 2.12… }`). These are the
+(`potentials_md` adds `Momentum_Dependence: { C: -63.1…, Lambda: 2.12… }`). These are the
 mean‑field benchmark.
 
 ---

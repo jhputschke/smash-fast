@@ -1,0 +1,56 @@
+# Cu+Cu mean field WITH momentum dependence -- the 2.4x (8 threads) speedup case.
+# Identical physics to potentials_nomd.yaml plus the Momentum_Dependence block.
+# Fixed seed and a short End_Time keep it a quick, reproducible benchmark: the
+# md5 of particle_lists.oscar must be identical across OMP thread counts.
+# This is the committed source for tab_check.sh / gather_check.sh (it replaces the
+# formerly-referenced generated dump verify/md_on/config.yaml).
+Logging:
+    default: INFO
+
+General:
+    Modus:          Collider
+    Time_Step_Mode: Fixed
+    Delta_Time:     0.1
+    End_Time:       3.0
+    Randomseed:     12345
+    Nevents:        1
+    Testparticles:  10
+    Ensembles:      20
+
+Output:
+    Output_Interval: 5.0
+    Particles:
+        Format:          ["Oscar2013"]
+
+Modi:
+    Collider:
+        Projectile:
+            Particles: {2212: 29, 2112: 35} #Cu64
+        Target:
+            Particles: {2212: 29, 2112: 35} #Cu64
+        E_Kin: 1.23
+        Fermi_Motion: on
+
+Potentials: # incompressibility 348.2 MeV
+    Skyrme:
+        Skyrme_A:   -15.4367459528553
+        Skyrme_B:   42.5791599330548
+        Skyrme_Tau: 2.17489852989658
+    Momentum_Dependence:
+        C:      -63.1052345564237
+        Lambda: 2.11952307496017
+    Use_Potentials_Outside_Lattice: False
+    Symmetry:
+        S_Pot: 15.8
+
+Collision_Term:
+    Pauli_Blocking:
+        Spatial_Averaging_Radius:   1.86
+        Momentum_Averaging_Radius:  0.08
+        Gaussian_Cutoff:            2.2
+
+Lattice:
+    Automatic: False
+    Origin: [-40.0, -40.0, -40.0]
+    Sizes: [80.0 ,80.0 ,80.0]
+    Cell_Number: [80, 80, 80]

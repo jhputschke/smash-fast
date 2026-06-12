@@ -1,0 +1,19 @@
+# Speedup verification harness.
+#
+# Everything in verify/ is scratch by default -- run output directories,
+# *.log files, the tabulation cache, generated config.yaml dumps, *.txt data.
+# We track only the curated configs and scripts the FAST docs reference, so the
+# benchmarks can be re-derived from a clean checkout.
+#
+# Ignore everything, then re-include the committed configs + scripts.
+*
+!.gitignore
+!README.md
+!*.sh
+!*.py
+!box_fast.yaml
+!box_heavy.yaml
+!potentials_nomd.yaml
+!potentials_md.yaml
+!strings_collider.yaml
+!strings_heavy.yaml

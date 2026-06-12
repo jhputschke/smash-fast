@@ -22,5 +22,5 @@ __pycache__/
 pythia*/
 # Convenience directory for your own files that should not be tracked
 tmp
-# Speedup verification scratch (outputs, tabulation cache, logs)
-verify/
+# Speedup verification harness: scratch (run outputs, logs, tabulation cache) is
+# ignored via verify/.gitignore, which keeps only the curated configs + scripts.

@@ -1,0 +1,29 @@
+Logging:
+    default: INFO
+
+General:
+    Modus:          Collider
+    End_Time:       10.0
+    Randomseed:     12345
+    Nevents:        1
+
+Output:
+    Output_Interval: 10.0
+    Particles:
+        Format:          ["Oscar2013"]
+        Only_Final:      Yes
+
+Modi:
+    Collider:
+        # Oxygen-16 on Oxygen-16, light enough to be fast but enough nucleons
+        # to produce many strings.
+        Projectile:
+            Particles: {2212: 8, 2112: 8}
+        Target:
+            Particles: {2212: 8, 2112: 8}
+        # sqrt(s_NN) ~ 17.3 GeV (SPS) -> string excitation dominates.
+        Sqrtsnn: 17.3
+
+Collision_Term:
+    Strings: True
+    Collision_Criterion: "Covariant"
