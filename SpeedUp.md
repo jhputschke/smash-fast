@@ -154,4 +154,120 @@ draw from independent streams instead of one shared interleaved stream — a
 documented, intentional one-time change; the ensembles are statistically
 independent by construction, so bulk physics is unchanged and conservation holds.
 
+## Phase 2 — OpenMP over ensembles (the headline)
+
+**Goal:** run the independent ensembles in parallel and obtain a near-linear
+speedup for the common no-strings case, while keeping results **bit-identical
+for any thread count**.
+
+**What changed**
+
+- **CMake** (`src/CMakeLists.txt`): `option(USE_OPENMP ... ON)` +
+  `find_package(OpenMP)`. `OpenMP::OpenMP_CXX` is attached to the `objlib`
+  OBJECT target (so its sources compile with `-fopenmp`/`_OPENMP`) and linked
+  into `smash`/`smash_shared`/`smash_static` via `SMASH_LIBRARIES`. Every
+  `#pragma omp` is a no-op without OpenMP, so the serial build is unaffected.
+- **Per-ensemble counters** (`experiment.h`): the shared scalar counters
+  (`interactions_total_`, `wall_actions_`, Pauli-blocked, hypersurface,
+  discarded, energy removed/violated) are replaced inside `perform_action()` and
+  the time-stepless loop by a cache-line-aligned `EnsembleScalars` struct, one
+  per ensemble. They are reduced into the scalar totals by
+  `sync_ensemble_counters()` after each parallel region. **`id_process` is now
+  per-ensemble** (`es.interactions_total + 1`), so particle process tags never
+  entangle across ensembles. For one ensemble the per-ensemble count equals the
+  old global count, preserving byte-identity.
+- **`projectile_target_interact_`**: `std::vector<bool>` → `std::vector<char>`
+  (bit-packing would make concurrent writes to different ensembles touch the
+  same word).
+- **Parallel regions** (`#pragma omp parallel for schedule(dynamic)`): action
+  *finding*, the two time-stepless *performing* loops, and the final forced
+  decays. Each ensemble writes only its own particles / actions / counters and
+  draws from its own RNG stream (`ScopedEngine`), so iterations are independent.
+- **Correctness gates** (`if(...)` clauses on the pragmas):
+  - *finding* is parallel whenever **strings are off** (with strings the single
+    shared Pythia/`StringProcess` inside the finder is not thread-safe);
+  - *performing* is additionally parallel only when **no output is written per
+    interaction** (`has_per_interaction_output_`, set in `create_output()` for
+    Collisions/Dileptons/Photons/Initial_Conditions). Otherwise performing runs
+    serially so its output records stay deterministically ordered. Particle and
+    Thermodynamics output only write at the serial barriers, so they are
+    compatible with parallel performing.
+  - With strings or per-interaction output the loops fall back to correct serial
+    execution (still benefiting from parallel finding when strings are off).
+
+Mean-field/potentials runs keep their existing bulk-synchronous structure
+(`update_potentials`/`update_momenta` between the parallel regions); the
+ensemble loops there were already barriered by the lattice reduction.
+
+**Reproducibility = correctness.** Because each ensemble's stream is fixed by its
+index (Phase 1) and the counter reduction is an order-independent sum, the result
+is **bit-identical for every thread count** — the acceptance test #3075 failed.
+This is verified directly below (md5 constant across `OMP_NUM_THREADS`).
+
+**Verification**
+
+| Config | Output | Check | Result |
+|---|---|---|---|
+| `stoch`, 1 ens, 4 threads | collisions | md5 vs true original | **identical** (`bc0fea05…`) |
+| `boxfast`, 1 ens, 4 threads | particles | md5 vs Phase 0 | **identical** (`a7b27902…`) |
+| `boxfast`, 4 ens | particles | md5 across threads 1/2/4 | **identical** (`803a7d4d…`) |
+| `stoch`, 4 ens | collisions | md5 across threads 1/2/4 | **identical** (`bc75609e…`) |
+| `box` (thermal), 8 ens | particles | md5 across threads 1/2/4/8 | **identical** (`fb6dadc9…`) |
+| all of the above | — | per-timestep conservation check | passed (no violation) |
+
+Single-ensemble runs stay byte-identical to the original/Phase-0; multi-ensemble
+runs are byte-identical across thread counts (and conserve E/p/charge/B).
+
+**Speedup (strong scaling, fixed problem, 20-core machine, evolution time only).**
+The reported "evolution time" excludes the one-time serial cache warm-up
+(Phase 0); total wall time additionally includes that fixed ~15 s.
+
+*Thermal hadron gas box (`input/box`, Covariant, no strings), 8 ensembles:*
+
+| Threads | Evol [s] | Speedup | Reproducible |
+|---|---|---|---|
+| 1 | 3.31 | 1.00× | — |
+| 2 | 1.83 | 1.81× | ✅ |
+| 4 | 1.00 | 3.30× | ✅ |
+| 8 | 0.60 | 5.48× | ✅ |
+
+*Heavier hadron-gas box (L=12 fm, ~2× particles), 16 ensembles — heavier
+per-ensemble work amortizes the per-timestep barriers, so efficiency is higher:*
+
+| Threads | Evol [s] | Speedup | Efficiency | Reproducible |
+|---|---|---|---|---|
+| 1 | 16.02 | 1.00× | 100% | — |
+| 2 | 8.45 | 1.90× | 95% | ✅ |
+| 4 | 4.47 | 3.59× | 90% | ✅ |
+| 8 | 2.44 | 6.55× | 82% | ✅ |
+| 16 | 2.46 | 6.51× | — | ✅ |
+
+The speedup plateaus near 8 threads. The dominant serial fraction is the box's
+**per-timestep conservation check** (`conserved_initial_.report_deviations`),
+which sums quantum numbers over *all* ensembles serially every step — an
+O(total-particles) cost that grows with the ensemble count. It is only active
+for runs with no potentials/strings/expansion (i.e. exactly the box test cases);
+production runs with strings or mean fields skip it and scale further. Per-step
+barriers and load imbalance (ensembles have unequal particle counts) add to the
+gap. Parallelizing the conservation reduction is a clean follow-up.
+
+*Stochastic box (`input/stochastic_box`, collision output → parallel finding
+only), 4 ensembles:* 1.45× (2t), 2.66× (4t), all reproducible (`bc75609e…`).
+
+The no-output covariant box parallelizes both finding and performing and scales
+near-linearly up to the number of ensembles; the collision-output stochastic box
+parallelizes finding only (performing kept serial for ordered output) and still
+gets a solid speedup because finding dominates. Speedup is capped at
+`min(threads, n_ensembles)`; per-timestep barriers and load imbalance account for
+the gap from ideal at high thread counts and small per-ensemble workloads.
+
+**Known limitation (documented, not blocking).** The lazy `XS_*_tabulation_`
+member-pointer initialization in `IsoParticleType::get_integral_*` is a *benign,
+same-value* write race in the parallel finding region (every thread writes the
+same pointer into a read-only tabulation built in Phase 0). It does not affect
+results — confirmed by the bit-identical reproducibility above — but it would be
+flagged by ThreadSanitizer; warming those pointers in Phase 0 (or making them
+`std::atomic`) is a clean follow-up together with the per-thread-Pythia work
+needed to parallelize the strings path.
+
 

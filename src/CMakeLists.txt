@@ -171,6 +171,25 @@ set(SMASH_LIBRARIES
 )
 
 # ~~~
+# OpenMP parallelization over independent ensembles (Phase 2 of the speedup
+# plan). Guarded by an option so the serial build (USE_OPENMP=OFF) is unchanged.
+# When found, OpenMP::OpenMP_CXX is linked into all SMASH targets and attached to
+# the objlib OBJECT target so its sources compile with -fopenmp (defining
+# _OPENMP). Every "#pragma omp" is a no-op without it, so the code still builds
+# and runs serially.
+# ~~~
+option(USE_OPENMP "Enable OpenMP parallelization over ensembles." ON)
+if(USE_OPENMP)
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        message(STATUS "OpenMP ${OpenMP_CXX_VERSION} found: enabling parallel ensembles.")
+        set(SMASH_LIBRARIES ${SMASH_LIBRARIES} OpenMP::OpenMP_CXX)
+    else()
+        message(STATUS "OpenMP not found: building serial SMASH.")
+    endif()
+endif()
+
+# ~~~
 # For GNU and Clang compilers, link to C++ filesystem library if compiler version requires it
 #  -> See "Notes" at https://en.cppreference.com/w/cpp/filesystem
 #
@@ -291,6 +310,13 @@ endif()
 # https://stackoverflow.com/a/29824424 NOTE: shared libraries need PIC and this is already set for
 # all targets through CMAKE_POSITION_INDEPENDENT_CODE
 add_library(objlib OBJECT ${smash_src})
+
+# Compile the object library with OpenMP so the "#pragma omp" directives are
+# honored and _OPENMP is defined; the link requirement propagates to the final
+# targets via SMASH_LIBRARIES.
+if(USE_OPENMP AND OpenMP_CXX_FOUND)
+    target_link_libraries(objlib PUBLIC OpenMP::OpenMP_CXX)
+endif()
 
 add_executable(smash smash.cc $<TARGET_OBJECTS:objlib>)
 

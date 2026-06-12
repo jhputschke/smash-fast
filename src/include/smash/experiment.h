@@ -421,8 +421,13 @@ class Experiment : public ExperimentBase {
   /**
    * Whether the projectile and the target collided.
    * One value for each ensemble.
+   *
+   * Stored as char rather than bool: std::vector<bool> is bit-packed, so
+   * concurrent writes to different ensembles would touch the same word. With
+   * char each ensemble owns a distinct byte, which is safe to write in parallel
+   * (Phase 2).
    */
-  std::vector<bool> projectile_target_interact_;
+  std::vector<char> projectile_target_interact_;
 
   /**
    * The initial nucleons in the ColliderModus propagate with
@@ -715,6 +720,69 @@ class Experiment : public ExperimentBase {
    */
   double total_energy_violated_by_Pythia_ = 0.0;
 
+  /**
+   * Per-ensemble accumulators for the counters above (Phase 2).
+   *
+   * During the parallel-over-ensembles region every ensemble writes only to its
+   * own entry, so there is no race. After the region the entries are reduced
+   * into the scalar totals above by sync_ensemble_counters(). The scalars remain
+   * the single source of truth read by the output/reporting code. Crucially,
+   * the per-ensemble interaction count also drives `id_process` so that particle
+   * process tags do not entangle across ensembles. The struct is cache-line
+   * aligned to avoid false sharing between adjacent ensembles.
+   */
+  struct alignas(64) EnsembleScalars {
+    /// Number of performed interactions in this ensemble.
+    uint64_t interactions_total = 0;
+    /// Number of wall crossings in this ensemble.
+    uint64_t wall_actions = 0;
+    /// Number of Pauli-blocked interactions in this ensemble.
+    uint64_t pauli_blocked = 0;
+    /// Number of hypersurface-crossing actions in this ensemble.
+    uint64_t hypersurface_crossings = 0;
+    /// Number of discarded (invalidated) interactions in this ensemble.
+    uint64_t discarded_interactions = 0;
+    /// Energy removed by hypersurface crossings in this ensemble.
+    double energy_removed = 0.0;
+    /// Energy violation introduced by Pythia in this ensemble.
+    double energy_violated_by_pythia = 0.0;
+  };
+  /// Per-ensemble counter accumulators, one entry per ensemble.
+  std::vector<EnsembleScalars> ens_scalars_;
+
+  /**
+   * True if any configured output writes from inside perform_action() or the
+   * time-stepless propagation (collision, dilepton, photon or initial-condition
+   * output). When true the per-ensemble *performing* loop is kept serial so the
+   * output stays deterministically ordered; the action *finding* loop, which
+   * produces no output, is parallelized regardless. Set in create_output().
+   */
+  bool has_per_interaction_output_ = false;
+
+  /**
+   * Reduce the per-ensemble counter accumulators into the scalar totals.
+   * Called after each parallel-over-ensembles performing region, before any
+   * code reads the scalar totals.
+   */
+  void sync_ensemble_counters() {
+    interactions_total_ = 0;
+    wall_actions_total_ = 0;
+    total_pauli_blocked_ = 0;
+    total_hypersurface_crossing_actions_ = 0;
+    discarded_interactions_total_ = 0;
+    total_energy_removed_ = 0.0;
+    total_energy_violated_by_Pythia_ = 0.0;
+    for (const auto &e : ens_scalars_) {
+      interactions_total_ += e.interactions_total;
+      wall_actions_total_ += e.wall_actions;
+      total_pauli_blocked_ += e.pauli_blocked;
+      total_hypersurface_crossing_actions_ += e.hypersurface_crossings;
+      discarded_interactions_total_ += e.discarded_interactions;
+      total_energy_removed_ += e.energy_removed;
+      total_energy_violated_by_Pythia_ += e.energy_violated_by_pythia;
+    }
+  }
+
   /// This indicates whether kinematic cuts are enabled for the IC output
   bool kinematic_cuts_for_IC_output_ = false;
 
@@ -742,6 +810,15 @@ void Experiment<Modus>::create_output(const std::string &format,
                                       const std::string &content,
                                       const std::filesystem::path &output_path,
                                       const OutputParameters &out_par) {
+  /* Track whether any output writes from inside perform_action()/the
+   * time-stepless propagation. Such per-interaction output forces the
+   * performing loop to stay serial so its records remain deterministically
+   * ordered (Phase 2). Particle/Thermodynamics output only writes at the
+   * serial barriers and is therefore compatible with parallel performing. */
+  if (content == "Collisions" || content == "Dileptons" ||
+      content == "Photons" || content == "Initial_Conditions") {
+    has_per_interaction_output_ = true;
+  }
   // Disable output which do not properly work with multiple ensembles
   if (ensembles_.size() > 1) {
     auto abort_because_of = [](const std::string &s) {
@@ -2169,6 +2246,8 @@ void Experiment<Modus>::initialize_new_event() {
   /* Save the initial conserved quantum numbers and total momentum in
    * the system for conservation checks */
   conserved_initial_ = QuantumNumbers(ensembles_);
+  // Reset the per-ensemble accumulators and the reduced scalar totals.
+  ens_scalars_.assign(parameters_.n_ensembles, EnsembleScalars{});
   wall_actions_total_ = 0;
   previous_wall_actions_total_ = 0;
   interactions_total_ = 0;
@@ -2287,10 +2366,14 @@ template <typename Modus>
 bool Experiment<Modus>::perform_action(Action &action, int i_ensemble,
                                        bool include_pauli_blocking) {
   Particles &particles = ensembles_[i_ensemble];
+  // Per-ensemble counters: written only for this ensemble, so updating them is
+  // safe inside the parallel-over-ensembles region (Phase 2). Reduced into the
+  // scalar totals later by sync_ensemble_counters().
+  EnsembleScalars &es = ens_scalars_[i_ensemble];
   auto &incoming = action.incoming_particles();
   // Make sure to skip invalid and Pauli-blocked actions.
   if (!action.is_valid(particles)) {
-    discarded_interactions_total_++;
+    es.discarded_interactions++;
     logg[LExperiment].debug(~einhard::DRed(), "✘ ", action,
                             " (discarded: invalid)");
     return false;
@@ -2322,7 +2405,7 @@ bool Experiment<Modus>::perform_action(Action &action, int i_ensemble,
   logg[LExperiment].debug("Process Type is: ", action.get_type());
   if (include_pauli_blocking && pauli_blocker_ &&
       action.is_pauli_blocked(ensembles_, *pauli_blocker_)) {
-    total_pauli_blocked_++;
+    es.pauli_blocked++;
     return false;
   }
 
@@ -2343,18 +2426,20 @@ bool Experiment<Modus>::perform_action(Action &action, int i_ensemble,
   }
 
   /* Make sure to pick a non-zero integer, because 0 is reserved for "no
-   * interaction yet". */
-  const auto id_process = static_cast<uint32_t>(interactions_total_ + 1);
+   * interaction yet". The id_process is per-ensemble (it counts interactions in
+   * this ensemble only), so particle process tags never entangle across
+   * ensembles in the parallel region. */
+  const auto id_process = static_cast<uint32_t>(es.interactions_total + 1);
   // we perform the action and collect possible energy violations by Pythia
-  total_energy_violated_by_Pythia_ += action.perform(&particles, id_process);
+  es.energy_violated_by_pythia += action.perform(&particles, id_process);
 
-  interactions_total_++;
+  es.interactions_total++;
   if (action.get_type() == ProcessType::Wall) {
-    wall_actions_total_++;
+    es.wall_actions++;
   }
   if (action.get_type() == ProcessType::Fluidization) {
-    total_hypersurface_crossing_actions_++;
-    total_energy_removed_ += action.incoming_particles()[0].momentum().x0();
+    es.hypersurface_crossings++;
+    es.energy_removed += action.incoming_particles()[0].momentum().x0();
   }
   // Calculate Eckart rest frame density at the interaction point
   double rho = 0.0;
@@ -2566,6 +2651,18 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
     throw std::logic_error(
         "Experiment cannot evolve the system beyond End_Time.");
   }
+  /* Phase 2 parallelization gates (constant across the run):
+   *  - action *finding* over ensembles is parallelized whenever strings are
+   *    off (with strings the single shared Pythia/StringProcess inside the
+   *    finder is not thread-safe);
+   *  - action *performing* is additionally only parallelized when no output is
+   *    written per interaction, so that such output stays deterministically
+   *    ordered. When kept serial the loop still runs correctly, just on one
+   *    thread. The flags are unused without OpenMP (the pragmas are no-ops).
+   */
+  [[maybe_unused]] const bool parallel_find = !parameters_.strings_switch;
+  [[maybe_unused]] const bool parallel_perform =
+      parallel_find && !has_per_interaction_output_;
   while (*(parameters_.labclock) < t_end) {
     const double dt = parameters_.labclock->timestep_duration();
     logg[LExperiment].debug("Timestepless propagation for next ", dt, " fm.");
@@ -2596,6 +2693,11 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
     }
 
     std::vector<Actions> actions(parameters_.n_ensembles);
+    /* (1) Parallel action finding over ensembles. Each iteration writes only
+     * actions[i_ens] and draws from its own RNG stream (ScopedEngine), so the
+     * iterations are independent. Dynamic schedule balances ensembles with
+     * uneven particle counts. */
+#pragma omp parallel for schedule(dynamic) if (parallel_find)
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
       random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
       actions[i_ens].clear();
@@ -2637,22 +2739,29 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
 
     /* \todo (optimizations) Adapt timestep size here */
 
-    /* (2) Propagate from action to action until next output or timestep end */
+    /* (2) Propagate from action to action until next output or timestep end.
+     * Performing mutates per-ensemble particles and counters only; the reduced
+     * scalar totals are refreshed by sync_ensemble_counters() before any code
+     * (intermediate_output, reporting) reads them. */
     const double end_timestep_time = parameters_.labclock->next_time();
     while (next_output_time() < end_timestep_time) {
+#pragma omp parallel for schedule(dynamic) if (parallel_perform)
       for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
         random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
         run_time_evolution_timestepless(actions[i_ens], i_ens,
                                         next_output_time());
       }
+      sync_ensemble_counters();
       ++(*parameters_.outputclock);
 
       intermediate_output();
     }
+#pragma omp parallel for schedule(dynamic) if (parallel_perform)
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
       random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
       run_time_evolution_timestepless(actions[i_ens], i_ens, end_timestep_time);
     }
+    sync_ensemble_counters();
 
     /* (3) Update potentials (if computed on the lattice) and
      *     compute new momenta according to equations of motion */
@@ -2748,7 +2857,7 @@ void Experiment<Modus>::run_time_evolution_timestepless(
     // get next action
     ActionPtr act = actions.pop();
     if (!act->is_valid(particles)) {
-      discarded_interactions_total_++;
+      ens_scalars_[i_ensemble].discarded_interactions++;
       logg[LExperiment].debug(~einhard::DRed(), "✘ ", act,
                               " (discarded: invalid)");
       continue;
@@ -2790,7 +2899,7 @@ void Experiment<Modus>::run_time_evolution_timestepless(
           outgoing_particles, particles, time_left, beam_momentum_));
     }
 
-    check_interactions_total(interactions_total_);
+    check_interactions_total(ens_scalars_[i_ensemble].interactions_total);
   }
 
   propagate_and_shine(end_time_propagation, particles);
@@ -3053,10 +3162,17 @@ void Experiment<Modus>::do_final_interactions() {
   /* At end of time evolution: Force all resonances to decay. In order to handle
    * decay chains, we need to loop until no further actions occur. */
   bool actions_performed, actions_found;
-  uint64_t interactions_old;
+  [[maybe_unused]] const bool parallel_perform =
+      !parameters_.strings_switch && !has_per_interaction_output_;
+  sync_ensemble_counters();
   do {
     actions_found = false;
-    interactions_old = interactions_total_;
+    const uint64_t interactions_before = interactions_total_;
+    /* The per-ensemble loop is independent (each touches only ensemble i_ens
+     * and its own RNG stream); parallelized under the same gate as performing.
+     * actions_found is OR-reduced across threads. */
+#pragma omp parallel for schedule(dynamic) if (parallel_perform) \
+    reduction(|| : actions_found)
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
       random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
       Actions actions;
@@ -3079,7 +3195,8 @@ void Experiment<Modus>::do_final_interactions() {
         perform_action(*actions.pop(), i_ens, false);
       }
     }
-    actions_performed = interactions_total_ > interactions_old;
+    sync_ensemble_counters();
+    actions_performed = interactions_total_ > interactions_before;
     // Throw an error if actions were found but not performed
     if (actions_found && !actions_performed) {
       throw std::runtime_error("Final actions were found but not performed.");
