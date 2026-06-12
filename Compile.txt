@@ -1,3 +1,5 @@
+Linux GB10
+
 cmake .. \
 -DCMAKE_PREFIX_PATH=/home/putschke/miniconda3/envs/js_fno \
 -DPythia_INCLUDE_DIR=/home/putschke/JetScape/smash-fast/pythia8316/include \
@@ -7,3 +9,15 @@ cmake .. \
 and 
 
 export PYTHIA8DATA=/home/putschke/JetScape/smash-fast/pythia8316/share/Pythia8/xmldoc
+
+Mac M3 Max
+
+cmake .. \
+  -DCMAKE_PREFIX_PATH=/opt/homebrew/ \
+  -DPythia_INCLUDE_DIR=/Users/du8478/JetScape/smash-fast/pythia8316/include \
+  -DPythia_LIBRARY=/Users/du8478/JetScape/smash-fast/pythia8316/lib/libpythia8.a \
+  -DPythia_XMLDOC_DIR=/Users/du8478/JetScape/smash-fast/pythia8316/share/Pythia8/xmldoc
+
+export PYTHIA8DATA=/Users/du8478/JetScape/smash-fast/pythia8316/share/Pythia8/xmldoc
+
+

@@ -180,6 +180,37 @@ set(SMASH_LIBRARIES
 # ~~~
 option(USE_OPENMP "Enable OpenMP parallelization over ensembles." ON)
 if(USE_OPENMP)
+    # ~~~
+    # Apple Clang (/usr/bin/clang++) does not ship the OpenMP runtime, so plain
+    # find_package(OpenMP) fails with "missing OpenMP_CXX_FLAGS / OpenMP_CXX_LIB_NAMES".
+    # The runtime is provided by Homebrew's "libomp" keg (brew install libomp), but
+    # it is keg-only, so CMake needs explicit hints to its headers and library.
+    # We locate the keg via "brew --prefix libomp" and fall back to the standard
+    # Apple-Silicon (/opt/homebrew) and Intel (/usr/local) prefixes.
+    # ~~~
+    if(APPLE
+       AND CMAKE_CXX_COMPILER_ID MATCHES "Clang"
+       AND NOT OpenMP_CXX_FLAGS)
+        execute_process(
+            COMMAND brew --prefix libomp
+            OUTPUT_VARIABLE LIBOMP_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(NOT LIBOMP_PREFIX OR NOT EXISTS "${LIBOMP_PREFIX}")
+            foreach(_candidate "/opt/homebrew/opt/libomp" "/usr/local/opt/libomp")
+                if(EXISTS "${_candidate}")
+                    set(LIBOMP_PREFIX "${_candidate}")
+                    break()
+                endif()
+            endforeach()
+        endif()
+        if(LIBOMP_PREFIX AND EXISTS "${LIBOMP_PREFIX}/lib/libomp.dylib")
+            message(STATUS "Using Homebrew libomp for OpenMP: ${LIBOMP_PREFIX}")
+            set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include")
+            set(OpenMP_CXX_LIB_NAMES "omp")
+            set(OpenMP_omp_LIBRARY "${LIBOMP_PREFIX}/lib/libomp.dylib")
+        endif()
+    endif()
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
         message(STATUS "OpenMP ${OpenMP_CXX_VERSION} found: enabling parallel ensembles.")
