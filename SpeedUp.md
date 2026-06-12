@@ -100,4 +100,58 @@ run's built-in per-timestep conservation check never tripped. Bulk observables a
 statistically unchanged. From Phase 1 onward the covariant baseline is taken
 against the post-Phase-0 binary.
 
+## Phase 1 — Thread-safe RNG with per-ensemble seeding
+
+**Goal:** make the random-number engine thread-safe and give each ensemble a
+persistent, independent stream whose sequence depends only on the master seed
+and the ensemble index — so that the parallel evolution of Phase 2 is
+bit-reproducible for any number of threads. This neutralizes the RNG half of
+issue #3075.
+
+**What changed**
+
+- `random.h`/`random.cc`: the shared engine is now `thread_local`, so each
+  OpenMP worker thread owns an independent engine. Added:
+  - `derive_seed(master, index)` — SplitMix64; index 0 returns the master seed
+    unchanged (legacy sequence), indices > 0 get independent mixed seeds.
+  - `get_engine_state()` / `set_engine_state()` and a `ScopedEngine` RAII guard
+    that swaps a per-ensemble engine state in/out of the thread-local engine.
+- `experiment.h`: new member `std::vector<random::Engine> ensemble_rng_`. In
+  `initialize_new_event()` each ensemble's stream is set up before its initial
+  conditions are sampled: ensemble 0 **inherits the live engine state** (so a
+  one-ensemble run reproduces the legacy sequence exactly), ensembles > 0 are
+  seeded from `derive_seed(master, i)`. Every per-ensemble region that draws
+  random numbers — initial conditions, thermalization, action *finding*
+  (stochastic criterion), the time-stepless *performing*, and the final forced
+  decays — is wrapped in a `ScopedEngine`, so each ensemble consumes its own
+  stream regardless of which thread runs it or in what order.
+
+The ~200 free-function call sites (`random::uniform`, `random::poisson`, …) are
+unchanged: they keep drawing from the thread-local engine.
+
+**Why per-ensemble, not per-thread.** Seeding per thread would make results
+depend on the thread→ensemble mapping. Seeding per *ensemble index* makes the
+stream a pure function of `(master_seed, i)`, so `OMP_NUM_THREADS = 1/2/4/8` all
+produce identical results — the acceptance test #3075 failed.
+
+**Runtime.** No parallelism yet, so no speedup. The `std::swap` of the ~2.5 KB
+engine state at each per-ensemble region is negligible against the physics work.
+
+**Verification**
+
+| Config | Check | Result |
+|---|---|---|
+| `stoch`, 1 ensemble | md5 vs **true original** | **identical** (`bc0fea05…`) |
+| `boxfast`, 1 ensemble | md5 vs Phase 0 | **identical** (`a7b27902…`) |
+| `boxfast`, 4 ensembles | determinism (run twice) | identical (`803a7d4d…`, N=9370) |
+| `boxfast`, 4 ensembles | per-timestep conservation check | passed (no violation thrown) |
+
+Single-ensemble runs are byte-identical because ensemble 0 inherits the live
+engine state — the refactor is a pure pass-through there. The 4-ensemble result
+(`803a7d4d…`) is the **reference Phase 2 must reproduce for every thread count**.
+It legitimately differs from a Phase-0 4-ensemble run because the ensembles now
+draw from independent streams instead of one shared interleaved stream — a
+documented, intentional one-time change; the ensembles are statistically
+independent by construction, so bulk physics is unchanged and conservation holds.
+
 

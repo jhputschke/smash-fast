@@ -11,6 +11,7 @@
 #define SRC_INCLUDE_SMASH_RANDOM_H_
 
 #include <cassert>
+#include <cstdint>
 #include <limits>
 #include <random>
 #include <utility>
@@ -27,7 +28,15 @@ namespace random {
 using Engine = std::mt19937_64;
 
 /// The engine that is used commonly by all distributions.
-extern /*thread_local (see #3075)*/ Engine engine;
+///
+/// It is thread_local so that each OpenMP worker thread owns an independent
+/// engine (Phase 1 of the parallelization plan). Reproducibility across thread
+/// counts is achieved not by seeding per thread, but by giving each ensemble a
+/// persistent engine state that is swapped into this thread-local engine while
+/// that ensemble is processed (see ScopedEngine and derive_seed below). The
+/// heavy GSL integrators flagged together with this in #3075 stay plain shared
+/// statics; they are warmed read-only in Phase 0 and never written here.
+extern thread_local Engine engine;
 
 /** Provides uniform random numbers on a fixed interval.
  *
@@ -76,6 +85,53 @@ void set_seed(T &&seed) {
 
 /// Advance the engine's state and return the generated value.
 inline Engine::result_type advance() { return engine(); }
+
+/**
+ * Derive an independent 64-bit seed for stream \p index from a \p master_seed.
+ *
+ * Uses the SplitMix64 finalizer. Index 0 returns the master seed unchanged
+ * (so a one-ensemble run reproduces the legacy sequence exactly); indices > 0
+ * get well-mixed, statistically independent seeds. The mapping depends only on
+ * (master_seed, index) — never on thread id or scheduling — which is what makes
+ * parallel-ensemble runs reproducible across any number of threads.
+ *
+ * \param[in] master_seed The per-event master seed.
+ * \param[in] index The ensemble (stream) index.
+ * \return A derived seed for that stream.
+ */
+uint64_t derive_seed(uint64_t master_seed, uint64_t index);
+
+/// \return a copy of the current state of the thread-local engine.
+inline Engine get_engine_state() { return engine; }
+
+/// Overwrite the thread-local engine with the given \p state.
+inline void set_engine_state(const Engine &state) { engine = state; }
+
+/**
+ * RAII guard giving each ensemble its own persistent RNG stream.
+ *
+ * On construction it swaps a saved per-ensemble engine state into the global
+ * thread-local engine; on destruction it swaps the (now advanced) state back
+ * out. This keeps the ~200 free-function call sites unchanged while making the
+ * stream a deterministic function of the ensemble index. Each ensemble must be
+ * processed by at most one thread at a time (guaranteed by the OpenMP "for"
+ * distribution over ensembles), so there is no race on the saved slot.
+ */
+class ScopedEngine {
+ public:
+  /// Swap \p slot into the active engine.
+  explicit ScopedEngine(Engine &slot) : slot_(slot) {
+    std::swap(engine, slot_);
+  }
+  /// Swap the advanced engine state back into the slot.
+  ~ScopedEngine() { std::swap(engine, slot_); }
+  ScopedEngine(const ScopedEngine &) = delete;
+  ScopedEngine &operator=(const ScopedEngine &) = delete;
+
+ private:
+  /// The per-ensemble engine state borrowed for this scope.
+  Engine &slot_;
+};
 
 /**
  * \returns A uniformly distributed random real number \f$\chi \in [{\rm

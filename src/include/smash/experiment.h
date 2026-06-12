@@ -384,6 +384,17 @@ class Experiment : public ExperimentBase {
   std::vector<Particles> ensembles_;
 
   /**
+   * One persistent random-number engine state per ensemble (Phase 1).
+   *
+   * Each ensemble draws from its own stream, seeded as a deterministic function
+   * of the per-event master seed and the ensemble index (see
+   * random::derive_seed). The state is swapped into the global thread-local
+   * engine while an ensemble is processed (see random::ScopedEngine), so the
+   * result is identical for any number of OpenMP threads.
+   */
+  std::vector<random::Engine> ensemble_rng_;
+
+  /**
    * An instance of potentials class, that stores parameters of potentials,
    * calculates them and their gradients.
    */
@@ -2061,6 +2072,10 @@ EventInfo fill_event_info(const std::vector<Particles> &ensembles,
 template <typename Modus>
 void Experiment<Modus>::initialize_new_event() {
   random::set_seed(seed_);
+  /* Master seed of this event, used to derive one independent RNG stream per
+   * ensemble below (Phase 1). Captured before the engine is advanced for the
+   * next event's seed. */
+  const uint64_t event_master_seed = static_cast<uint64_t>(seed_);
   logg[LExperiment].info() << "random number seed: " << seed_;
   /* Set seed for the next event. It has to be positive, so it can be entered
    * in the config.
@@ -2094,14 +2109,27 @@ void Experiment<Modus>::initialize_new_event() {
     logg[LExperiment].info("Impact parameter = ", modus_.impact_parameter(),
                            " fm");
   }
-  for (Particles &particles : ensembles_) {
-    start_time = modus_.initial_conditions(&particles, parameters_);
-  }
-  /* For box modus make sure that particles are in the box. In principle, after
-   * a correct initialization they should be, so this is just playing it safe.
-   */
-  for (Particles &particles : ensembles_) {
-    modus_.impose_boundary_conditions(&particles, outputs_);
+  /* Phase 1: give each ensemble its own persistent RNG stream before sampling
+   * its initial conditions. Ensemble 0 inherits the live engine state, so a
+   * single-ensemble run reproduces the legacy sequence exactly; ensembles > 0
+   * are seeded from independent derived seeds. The streams depend only on the
+   * master seed and the ensemble index, never on thread scheduling, which is
+   * what makes the later parallel evolution reproducible across thread counts.
+   * Impact parameter sampling above is intentionally shared (drawn once from
+   * the live engine before ensemble 0 inherits it). */
+  ensemble_rng_.resize(parameters_.n_ensembles);
+  for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+    if (i_ens == 0) {
+      ensemble_rng_[0] = random::get_engine_state();
+    } else {
+      ensemble_rng_[i_ens].seed(random::derive_seed(event_master_seed, i_ens));
+    }
+    random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
+    start_time = modus_.initial_conditions(&ensembles_[i_ens], parameters_);
+    /* For box modus make sure that particles are in the box. In principle,
+     * after a correct initialization they should be, so this is just playing
+     * it safe. */
+    modus_.impose_boundary_conditions(&ensembles_[i_ens], outputs_);
   }
   // Reset the simulation clock
   double timestep = delta_time_startup_;
@@ -2552,6 +2580,7 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
                                                ignore_cells_under_treshold);
       const double current_t = parameters_.labclock->current_time();
       for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+        random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
         thermalizer_->thermalize(ensembles_[i_ens], current_t,
                                  parameters_.testparticles);
         ThermalizationAction th_act(*thermalizer_, current_t);
@@ -2568,6 +2597,7 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
 
     std::vector<Actions> actions(parameters_.n_ensembles);
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+      random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
       actions[i_ens].clear();
       if (ensembles_[i_ens].size() > 0 && action_finders_.size() > 0) {
         /* (1.a) Create grid. */
@@ -2611,6 +2641,7 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
     const double end_timestep_time = parameters_.labclock->next_time();
     while (next_output_time() < end_timestep_time) {
       for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+        random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
         run_time_evolution_timestepless(actions[i_ens], i_ens,
                                         next_output_time());
       }
@@ -2619,6 +2650,7 @@ void Experiment<Modus>::run_time_evolution(const double t_end,
       intermediate_output();
     }
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+      random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
       run_time_evolution_timestepless(actions[i_ens], i_ens, end_timestep_time);
     }
 
@@ -3026,6 +3058,7 @@ void Experiment<Modus>::do_final_interactions() {
     actions_found = false;
     interactions_old = interactions_total_;
     for (int i_ens = 0; i_ens < parameters_.n_ensembles; i_ens++) {
+      random::ScopedEngine rng_guard(ensemble_rng_[i_ens]);
       Actions actions;
       // Dileptons: shining of remaining resonances
       if (dilepton_finder_ != nullptr) {
