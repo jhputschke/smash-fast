@@ -13,6 +13,10 @@
 #include <sstream>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "smash/decaymodes.h"
 #include "smash/experiment.h"
 #include "smash/filelock.h"
@@ -504,6 +508,13 @@ int main(int argc, char *argv[]) {
 
     auto configuration = setup_config_and_logging(input_path, particles,
                                                   decaymodes, extra_config);
+
+#ifdef _OPENMP
+    logg[LMain].info("FAST: OpenMP enabled, using ", omp_get_max_threads(),
+                     " threads");
+#else
+    logg[LMain].info("FAST: OpenMP disabled (serial build)");
+#endif
 
     setup_default_float_traps();
 
