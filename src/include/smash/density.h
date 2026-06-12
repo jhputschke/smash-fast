@@ -9,11 +9,16 @@
 #ifndef SRC_INCLUDE_SMASH_DENSITY_H_
 #define SRC_INCLUDE_SMASH_DENSITY_H_
 
+#include <array>
 #include <iostream>
 #include <tuple>
 #include <typeinfo>
 #include <utility>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "energymomentumtensor.h"
 #include "experimentparameters.h"
@@ -629,6 +634,242 @@ void update_lattice_with_list_of_particles(RectangularLattice<T> *lat,
 }
 
 /**
+ * A single particle's contribution to the gather-based density fill: its
+ * position and the precomputed inputs to unnormalized_smearing_factor(). The
+ * smearing-cube node box is kept in a separate, smaller array (GatherBox) so the
+ * hot box-cull scan stays cache-dense; this struct is only touched for the
+ * particles that actually pass the cull. Used by update_lattice_gather_covariant().
+ */
+struct GatherSource {
+  /// Particle position [fm] (center of the smearing cube).
+  ThreeVector pos;
+  /// Particle four-momentum [GeV].
+  FourVector p_mu;
+  /// Inverse mass 1/|p| [1/GeV].
+  double m_inv;
+  /// dens_factor * norm_factor_sf: the add_particle() weight prefactor.
+  double common_weight;
+  /// density_factor(type, dens_type): the add_particle_for_derivatives() factor.
+  double dens_factor;
+  /// Pointer into the (const, address-stable) ensembles, for velocity lookups.
+  const ParticleData *part;
+};
+
+/**
+ * Clamped node-index bounding box [l, u) of a particle's smearing cube
+ * (identical to the nodes iterate_in_cube() would visit). Stored contiguously in
+ * cell-list order so the per-node membership test scans cache-dense 24-byte
+ * entries; see update_lattice_gather_covariant().
+ */
+struct GatherBox {
+  /// Lower (inclusive) node index per axis.
+  int l[3];
+  /// Upper (exclusive) node index per axis.
+  int u[3];
+};
+
+/**
+ * Gather (node-parallel) equivalent of the CovariantGaussian branch of
+ * update_lattice_with_list_of_particles(), accumulated over all ensembles.
+ *
+ * The scatter visits, per particle, the cube of nodes within r_cut and writes
+ * each one -- a write-shared, hence serial, operation. This routine inverts the
+ * loop: every node sums the contributions of the nearby particles, so the heavy
+ * loop is over nodes and each node is written by exactly one thread (no races,
+ * no reduction). A uniform cell-list (bin size >= the smearing-cube half-width)
+ * restricts each node to the particles in its 3x3x3 bin neighborhood, and the
+ * exact iterate_in_cube() membership test (the stored [l, u) box) is reapplied,
+ * so the set of (node, particle) pairs and their weights are *identical* to the
+ * scatter -- only the per-node summation order differs (~1 ULP, validated by
+ * conservation as everywhere in the mean-field path). Each node sums its
+ * particles in a fixed cell-list order independent of the thread schedule, so
+ * the resulting lattice is byte-identical across thread counts.
+ *
+ * Used only for non-periodic lattices with CovariantGaussian smearing (the
+ * collider hot path); other cases fall back to the scatter.
+ *
+ * \tparam T LatticeType (must provide add_particle[/_for_derivatives]()).
+ * \param[inout] lat Lattice to fill (reset first).
+ * \param[in] dens_type Density type to compute.
+ * \param[in] par Testparticle number and Gaussian smearing parameters.
+ * \param[in] ensembles The particle vector for each ensemble.
+ * \param[in] compute_gradient Whether to compute the smearing gradients.
+ */
+template <typename T>
+void update_lattice_gather_covariant(RectangularLattice<T> *lat,
+                                     const DensityType dens_type,
+                                     const DensityParameters &par,
+                                     const std::vector<Particles> &ensembles,
+                                     const bool compute_gradient) {
+  lat->reset();
+  const std::array<int, 3> n_cells = lat->n_cells();
+  const std::array<double, 3> csize = lat->cell_sizes();
+  const std::array<double, 3> origin = lat->origin();
+  const double r_cut = par.r_cut();
+  const double norm_factor_gaus = par.norm_factor_sf();
+  const bool do_derivatives =
+      par.derivatives() == DerivativesMode::CovariantGaussian;
+
+  // Collect contributing particles, their smearing inputs, and their exact
+  // smearing-cube node boxes (boxes kept parallel to sources, bin-sorted below).
+  std::vector<GatherSource> sources;
+  std::vector<GatherBox> boxes;
+  for (const Particles &particles : ensembles) {
+    for (const ParticleData &part : particles) {
+      if (par.only_participants() &&
+          part.get_history().collisions_per_particle == 0) {
+        continue;  // spectator
+      }
+      const double dens_factor = density_factor(part.type(), dens_type);
+      if (std::abs(dens_factor) < really_small) {
+        continue;
+      }
+      const FourVector p_mu = part.momentum();
+      const double m = p_mu.abs();
+      if (unlikely(m < really_small)) {
+        logg[LDensity].warn("Gaussian smearing is undefined for momentum ",
+                            p_mu);
+        continue;
+      }
+      const ThreeVector pos = part.position().threevec();
+      // Node-index box of the smearing cube, identical to iterate_in_cube().
+      GatherBox box;
+      bool empty = false;
+      for (int i = 0; i < 3; i++) {
+        int l = static_cast<int>(
+            std::ceil((pos[i] - origin[i] - r_cut) / csize[i] - 0.5));
+        int u = static_cast<int>(
+            std::ceil((pos[i] - origin[i] + r_cut) / csize[i] - 0.5));
+        if (l < 0) {
+          l = 0;
+        }
+        if (u > n_cells[i]) {
+          u = n_cells[i];
+        }
+        if (l >= u) {  // cube lies outside the lattice along this axis
+          empty = true;
+          break;
+        }
+        box.l[i] = l;
+        box.u[i] = u;
+      }
+      if (empty) {
+        continue;
+      }
+      GatherSource s;
+      s.pos = pos;
+      s.p_mu = p_mu;
+      s.m_inv = 1.0 / m;
+      s.common_weight = dens_factor * norm_factor_gaus;
+      s.dens_factor = dens_factor;
+      s.part = &part;
+      sources.push_back(s);
+      boxes.push_back(box);
+    }
+  }
+  const int n_src = static_cast<int>(sources.size());
+  if (n_src == 0) {
+    return;
+  }
+
+  // Cell-list: bin size >= the smearing-cube half-width per axis, so that every
+  // node a particle smears to lies within +-1 bin of that particle's bin.
+  std::array<int, 3> B, nbin;
+  for (int i = 0; i < 3; i++) {
+    B[i] = static_cast<int>(std::ceil(r_cut / csize[i])) + 2;
+    nbin[i] = (n_cells[i] + B[i] - 1) / B[i];
+    if (nbin[i] < 1) {
+      nbin[i] = 1;
+    }
+  }
+  const auto bin_of = [&](int bx, int by, int bz) {
+    return bx + nbin[0] * (by + nbin[1] * bz);
+  };
+  const int n_bins = nbin[0] * nbin[1] * nbin[2];
+  // Bin each source by its box-midpoint node; build a CSR cell-list.
+  std::vector<int> src_bin(n_src);
+  std::vector<int> offset(n_bins + 1, 0);
+  for (int si = 0; si < n_src; si++) {
+    const GatherBox &box = boxes[si];
+    int mb[3];
+    for (int i = 0; i < 3; i++) {
+      int mid = (box.l[i] + box.u[i]) / 2;
+      if (mid >= n_cells[i]) {
+        mid = n_cells[i] - 1;
+      }
+      mb[i] = mid / B[i];
+    }
+    const int b = bin_of(mb[0], mb[1], mb[2]);
+    src_bin[si] = b;
+    offset[b + 1]++;
+  }
+  for (int b = 0; b < n_bins; b++) {
+    offset[b + 1] += offset[b];
+  }
+  // Counting sort into contiguous, bin-sorted arrays. The box array drives the
+  // hot membership scan (cache-dense 24-byte entries); the source array is read
+  // only when the box test passes. Sort order is stable -> deterministic.
+  std::vector<GatherBox> sbox(n_src);
+  std::vector<GatherSource> ssrc(n_src);
+  std::vector<int> cursor(offset.begin(), offset.end() - 1);
+  for (int si = 0; si < n_src; si++) {
+    const int k = cursor[src_bin[si]]++;
+    sbox[k] = boxes[si];
+    ssrc[k] = sources[si];
+  }
+
+  // Node-parallel gather. Each node owns its writes; schedule(dynamic) balances
+  // the clustered load without affecting the (fixed) per-node summation order.
+  const int nx = n_cells[0], ny = n_cells[1];
+  const int n_nodes = nx * ny * n_cells[2];
+#pragma omp parallel for schedule(dynamic, 512)
+  for (int node_i = 0; node_i < n_nodes; node_i++) {
+    const int ix = node_i % nx;
+    const int rem = node_i / nx;
+    const int iy = rem % ny;
+    const int iz = rem / ny;
+    const int bx0 = ix / B[0], by0 = iy / B[1], bz0 = iz / B[2];
+    T &node = (*lat)[node_i];
+    const ThreeVector r = lat->cell_center(ix, iy, iz);
+    for (int dz = -1; dz <= 1; dz++) {
+      const int bz = bz0 + dz;
+      if (bz < 0 || bz >= nbin[2]) {
+        continue;
+      }
+      for (int dy = -1; dy <= 1; dy++) {
+        const int by = by0 + dy;
+        if (by < 0 || by >= nbin[1]) {
+          continue;
+        }
+        for (int dx = -1; dx <= 1; dx++) {
+          const int bx = bx0 + dx;
+          if (bx < 0 || bx >= nbin[0]) {
+            continue;
+          }
+          const int b = bin_of(bx, by, bz);
+          const int k_end = offset[b + 1];
+          for (int k = offset[b]; k < k_end; k++) {
+            const GatherBox &bo = sbox[k];
+            if (ix < bo.l[0] || ix >= bo.u[0] || iy < bo.l[1] ||
+                iy >= bo.u[1] || iz < bo.l[2] || iz >= bo.u[2]) {
+              continue;  // node not in this particle's smearing cube
+            }
+            const GatherSource &s = ssrc[k];
+            const auto sf = unnormalized_smearing_factor(
+                s.pos - r, s.p_mu, s.m_inv, par, compute_gradient);
+            node.add_particle(*s.part, sf.first * s.common_weight);
+            if (do_derivatives) {
+              node.add_particle_for_derivatives(*s.part, s.dens_factor,
+                                                sf.second * norm_factor_gaus);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
  * Updates the contents on the lattice when ensembles are used.
  *
  * \param[out] lat The lattice on which the content will be updated
@@ -647,6 +888,24 @@ void update_lattice_accumulating_ensembles(
     const std::vector<Particles> &ensembles, const bool compute_gradient) {
   // Do not proceed if lattice does not exists/update not required
   if (lat == nullptr || lat->when_update() != update) {
+    return;
+  }
+  // Node-parallel gather for the collider hot path (non-periodic lattice,
+  // covariant Gaussian smearing): identical (node, particle) contributions to
+  // the scatter below, only reordered. The gather trades serial work-efficiency
+  // (cell-list over-inclusion) for node-parallelism, so it only beats the
+  // scatter from a few threads up (measured crossover ~4); below that, and when
+  // built without OpenMP, the scatter is strictly cheaper.
+  bool use_gather =
+      !lat->periodic() && par.smearing() == SmearingMode::CovariantGaussian;
+#ifdef _OPENMP
+  use_gather = use_gather && omp_get_max_threads() >= 4;
+#else
+  use_gather = false;
+#endif
+  if (use_gather) {
+    update_lattice_gather_covariant(lat, dens_type, par, ensembles,
+                                    compute_gradient);
     return;
   }
   lat->reset();

@@ -6,12 +6,20 @@ measuring each piece: **it is research-grade**, because the cost is split across
 several FP-chaos-sensitive components and the potentials collider's cross-thread
 reproducibility is FP-fragile.
 
-**Concrete win on this branch: the momentum-dependent root-find is now tabulated**
-(see "Implemented win — root-find tabulation" below). It is the cheapest, most
-self-contained piece: a single-threaded, deterministic ~1.11× on the full
-potentials evolution, with charge conserved exactly and energy to 2e-6 — no
-threading, no FP-fragility. The remaining bulk (the density *scatter*) is tackled
-by the gather rewrite.
+**Concrete wins on this branch (stacking to ~2.4× at 8 threads):**
+
+1. The momentum-dependent **root-find is tabulated** — the cheapest, most
+   self-contained piece: a single-threaded, deterministic ~1.11×, charge exact,
+   energy to 2e-6, no threading or FP-fragility (see "Implemented win — root-find
+   tabulation").
+2. The **density scatter is reimplemented as a node-parallel gather** with a
+   spatial cell-list — the bulk of the cost and the dominant multi-thread win
+   (2.04× over the tabulated scatter at 8 threads), thread-gated so it never
+   regresses serial runs (see "Implemented win — gather density fill"). It is the
+   GPU-friendly form (one thread/lane per node, no atomics).
+
+Both are validated by conservation, not byte-identity, because the collider is
+FP-chaotic.
 
 ## Where the time actually goes (Cu+Cu, SIS, 20 ensembles, 80³ lattice)
 
@@ -103,29 +111,79 @@ node, no reduction, no RNG, no root solver:
   total energy agrees to 7e-6 (energy/momentum are only conserved *in average*
   with mean fields), multiplicity within √N. So the FP-chaos is benign physically.
 
-## On the "gather density fill"
+## Implemented win — gather density fill (item 2)
 
-The gather (node-parallel) density fill was the proposed unlock. The investigation
-shows it would help **item 2 only** — and even then it is a *scatter→gather*
-algorithm change (build a spatial particle index, each node sums nearby
-particles), worth it mainly for **dense** lattices / GPU. It does **not** touch
-item 1 (the bigger cost) and does **not** restore cross-thread reproducibility.
-So it is not, by itself, "the unlock"; it is one of three pieces.
+The density smearing (item 2, the largest piece) is a *scatter*: each particle
+writes to the cube of ~hundreds of lattice nodes within `r_cut`, so parallelizing
+over particles races on shared nodes. It is now reimplemented as a **gather**
+(`update_lattice_gather_covariant()` in `density.h`): the loop is inverted so
+every **node** sums the contributions of the nearby particles. Each node is
+written by exactly one thread — no races, no reduction, GPU-friendly.
 
-## What a real mean-field speedup needs (research-grade)
+- **Spatial index.** A uniform cell-list (bin size ≥ the smearing-cube
+  half-width) restricts each node to the particles in its 3×3×3 bin
+  neighborhood. To keep the hot membership scan cache-dense, the per-particle
+  cube box `[l, u)` is stored in a separate, bin-sorted 24-byte array (SoA); the
+  full particle record is touched only for the ~9% of candidates that pass the
+  test.
+- **Exactness.** The stored box is the *identical* clamped node range that
+  `iterate_in_cube()` would visit, and the same membership test is reapplied, so
+  the set of (node, particle) pairs and their weights match the scatter exactly —
+  only the per-node summation order changes. Measured: gather vs scatter at the
+  same (single) thread give net charge **identical** (`Npart` 26552 = 26552) and
+  total energy agreeing to **2.9e-8** — a pure ~1-ULP reorder.
+- **Deterministic order.** Each node sums its particles in a fixed cell-list
+  order independent of the thread schedule, so the density lattice is
+  byte-identical across thread counts (the residual cross-thread divergence of
+  the *collider* comes from the other parallel components, not the fill).
 
-1. **FP-neutral, thread-safe root-finding** (item 1): make `root_eq_`
-   `thread_local` *and* keep the force evaluation FP-stable, parallelize the
-   per-particle loop, validate by conservation (not byte-identity).
-2. **Node-parallel density fill** (item 2): the gather rewrite with a spatial
-   index (also the GPU-friendly form).
-3. **Node-parallel lattice loops** (item 3): done here.
-4. A deliberate **FP-stability + reproducibility strategy** (fixed computation
-   order; accept that the result differs from the serial baseline and validate it
-   by conserved quantities), because the collider is FP-chaotic.
+**The catch — it is a parallel win, not a serial one.** The cell-list
+over-includes candidates (~10× box tests vs the scatter's zero over-inclusion),
+so single-threaded the gather is ~2.4× *slower* than the scatter. The dispatch is
+therefore **thread-gated**: non-periodic + covariant-Gaussian lattices use the
+gather only when `omp_get_max_threads() >= 4` (the measured crossover) and built
+with OpenMP; otherwise the scatter, which is strictly cheaper serially.
 
-That is a multi-week effort touching the force evaluation, the density fill, and
-the reproducibility contract together — not a single drop-in. The contrast with
-strings (where per-thread Pythia gave a clean, conserved ~2×) is that the
-mean-field bottleneck is spread across coupled, FP-sensitive, feedback-driven
-components.
+**Measured (potentials config, Cu+Cu SIS, 20 ensembles, 80³ lattice, seed 12345;
+gather stacks on top of the tabulation):**
+
+| threads | evol [s] | vs scatter+tab | cumulative vs original 29.95 s | path |
+|--------:|---------:|:---------------|:-------------------------------|:-----|
+| 1 | 26.5 | 1.02× | 1.13× | scatter (byte-identical to scatter+tab) |
+| 4 | 19.4 | 1.31× | 1.54× | gather |
+| 8 | 12.3 | **2.04×** | **2.43×** | gather |
+
+So at 8 threads the gather gives **2.04×** over the (already tabulated) scatter
+and **2.43×** over the original momentum-dependent baseline, with **no serial
+regression** (T=1 is byte-identical to the scatter+tab run). Physics is preserved
+as everywhere here — charge exact, energy in-average to ~1.5e-5, `Npart` within
+√N — validated by conservation, not byte-identity.
+
+This is the GPU-friendly form: one thread (or GPU lane) per node, no atomics, a
+cell-list that maps directly to a device spatial hash. It does **not** touch item
+1 (handled separately by the tabulation) and does **not** restore *collider*
+cross-thread reproducibility (the other parallel components remain FP-chaotic).
+
+## Where this leaves the three pieces
+
+1. **Root-finding** (item 1): addressed by **tabulation** — made cheap rather than
+   parallel, sidestepping the `thread_local`/FP-stability problem entirely.
+   Deterministic, ~1.11× on its own.
+2. **Density fill** (item 2): addressed by the **node-parallel gather** with a
+   spatial cell-list (also the GPU-friendly form), thread-gated so it never
+   regresses serial runs. The dominant multi-thread win (2.04× at 8 threads).
+3. **Per-node lattice loops** (item 3): node-parallel (`update_potentials`,
+   `drho_dxnu`).
+4. **Reproducibility contract**: settled pragmatically — the collider is
+   FP-chaotic, so every change here is validated by **conserved quantities**
+   (charge exact, energy in-average), not byte-identity. The tabulation and the
+   single-thread gather are deterministic; multi-thread results differ ~1 ULP and
+   cascade, but stay physically benign.
+
+**Net result on this branch (potentials config, 8 threads): ~2.4× over the
+original momentum-dependent baseline**, stacking the deterministic tabulation
+(item 1) and the thread-gated gather (item 2), with no serial regression. The
+contrast with strings (per-thread Pythia, a clean ~2× with no FP caveats) stands:
+the mean-field path needed three separate attacks on coupled, FP-sensitive
+components — but together they deliver a comparable speedup at realistic thread
+counts.
