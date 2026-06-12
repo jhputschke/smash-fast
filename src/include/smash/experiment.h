@@ -3203,6 +3203,11 @@ void Experiment<Modus>::update_potentials() {
                      density_param_, ensembles_,
                      parameters_.labclock->timestep_duration(), true);
       const size_t UBlattice_size = UB_lat_->size();
+      /* Per-node potential/force computation: each node is independent (it only
+       * reads its own jmu and writes its own U/F entries), so this O(N_nodes)
+       * loop — a dominant mean-field cost on fine lattices — is parallelized
+       * byte-identically (no reduction, no RNG, no root solver here). */
+#pragma omp parallel for schedule(static)
       for (size_t i = 0; i < UBlattice_size; i++) {
         auto jB = (*jmu_B_lat_)[i];
         const FourVector flow_four_velocity_B =
@@ -3238,6 +3243,10 @@ void Experiment<Modus>::update_potentials() {
       update_lattice_accumulating_ensembles(
           jmu_el_lat_.get(), LatticeUpdate::EveryTimestep, DensityType::Charge,
           density_param_, ensembles_, true);
+      /* Coulomb E/B field: each node integrates over a volume independently —
+       * the single most expensive per-node loop when Coulomb is on. Byte-identical
+       * to parallelize (per-node writes, read-only lattice). */
+#pragma omp parallel for schedule(static)
       for (size_t i = 0; i < EM_lat_->size(); i++) {
         ThreeVector electric_field = {0., 0., 0.};
         ThreeVector position = jmu_el_lat_->cell_center(i);
@@ -3265,6 +3274,9 @@ void Experiment<Modus>::update_potentials() {
             parameters_.labclock->timestep_duration());
       }
       const size_t UBlattice_size = UB_lat_->size();
+      /* Per-node VDF potential/force: independent per node, parallelized
+       * byte-identically. */
+#pragma omp parallel for schedule(static)
       for (size_t i = 0; i < UBlattice_size; i++) {
         auto jB = (*jmu_B_lat_)[i];
         (*UB_lat_)[i] = potentials_->vdf_pot(jB.rho(), jB.jmu_net());

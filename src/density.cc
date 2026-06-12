@@ -238,7 +238,13 @@ void update_lattice(
 
   // calculate gradients of rest frame density
   if (par.rho_derivatives() == RestFrameDensityDerivativesMode::On) {
-    for (auto &node : *lat) {
+    /* Each node's rest-frame density gradient depends only on that node, so this
+     * O(N_nodes) loop is parallelized byte-identically (Phase 2 mean-field:
+     * node-parallel update_potentials). */
+    const int n_nodes = lat->size();
+#pragma omp parallel for schedule(static)
+    for (int node_i = 0; node_i < n_nodes; node_i++) {
+      auto &node = (*lat)[node_i];
       // the rest frame density
       double rho = node.rho();
       const int sgn = rho > 0 ? 1 : -1;
