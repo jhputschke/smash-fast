@@ -1,11 +1,11 @@
 ########################################################
 #
-#    Copyright (c) 2015-2016,2018-2022,2024-2025
+#    Copyright (c) 2015-2016,2018-2022,2024
 #      SMASH Team
 #
 #    BSD 3-clause license
 #
-########################################################
+#########################################################
 
 # cmake-format: off
 #=============================================================================
@@ -41,6 +41,8 @@
 #  Pythia_LIBRARIES : includes 3 libraries above; not to be used if lhapdf is used
 #=============================================================================
 # cmake-format: on
+
+set(PYTHIA_ROOT_DIR "/home/putschke/JetScape/smash-fast/pythia8316/")
 
 if(NOT ("${Pythia_CONFIG_EXECUTABLE}" STREQUAL ""))
     message(STATUS "Trying to locate Pythia using variable Pythia_CONFIG_EXECUTABLE = ${Pythia_CONFIG_EXECUTABLE}"
