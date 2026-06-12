@@ -6,6 +6,13 @@ measuring each piece: **it is research-grade**, because the cost is split across
 several FP-chaos-sensitive components and the potentials collider's cross-thread
 reproducibility is FP-fragile.
 
+**Concrete win on this branch: the momentum-dependent root-find is now tabulated**
+(see "Implemented win — root-find tabulation" below). It is the cheapest, most
+self-contained piece: a single-threaded, deterministic ~1.11× on the full
+potentials evolution, with charge conserved exactly and energy to 2e-6 — no
+threading, no FP-fragility. The remaining bulk (the density *scatter*) is tackled
+by the gather rewrite.
+
 ## Where the time actually goes (Cu+Cu, SIS, 20 ensembles, 80³ lattice)
 
 A mean-field time step is dominated by **serial** work; the already-parallel
@@ -24,6 +31,47 @@ splits roughly into:
    the potential/force fields (`update_potentials`), and (when Coulomb is on) the
    per-node volume integral for the E/B field. O(N_nodes); embarrassingly
    parallel.
+
+## Implemented win — root-find tabulation (item 1)
+
+The momentum-dependent root-find (item 1) was attacked not by parallelizing it
+(which needs a `thread_local` `root_eq_` and stays FP-fragile) but by making each
+iteration **cheap**. Every GSL brent iteration evaluated
+`root_eq_potentials`, whose cost is the local-rest-frame potential
+
+```
+U(p_LRF, rho_LRF) = skyrme_pot(rho_LRF) + momentum_dependent_part(p_LRF, rho_LRF)
+```
+
+— a handful of transcendentals (`cbrt`, `log`, two `atan`, `pow`). But `U`
+depends only on `(p_LRF, rho_LRF)`; all Skyrme/momentum parameters are fixed for
+the run. So `U` is **pre-tabulated once at construction** on a uniform 2-D grid
+(`p ∈ [0,20] GeV` × `rho ∈ [0,5] fm⁻³`, 2001×1001) and each root-finder iteration
+becomes a **bilinear table lookup** instead of transcendental calls
+(`Potentials::build_lrf_potential_table()` / `interpolate_lrf_potential()` in
+`potentials.{h,cc}`). `root_eq_potentials` became a non-static `const` member so it
+can reach the table; values outside the grid are clamped (the function is smooth
+there and physical `p_LRF`/`rho` stay well inside).
+
+**Measured (potentials config, Cu+Cu SIS, 20 ensembles, 80³ lattice, seed 12345):**
+
+| threads | evol [s] | vs pre-tab 29.95 s |
+|--------:|---------:|:-------------------|
+| 1 | 26.98 | **1.11×** (tabulation only, deterministic) |
+| 4 | 25.48 | 1.18× (＋ ensemble parallelism) |
+| 8 | 25.19 | 1.19× |
+
+The 1-thread 1.11× is the clean tabulation-only number (29.95 s → 26.98 s);
+recall the no-momentum-dependence floor is 23.59 s, so tabulation recovers ~⅓ of
+the root-finding's ~21% (the GSL brent iterations still run, just cheaply).
+
+**Physics preserved (tabulated T=1 vs pre-tabulation reference):** net charge
+**exact** (11600 = 11600), total energy agrees to **2.5e-6** (mean fields conserve
+energy only *in average*), `Npart` within √N. The tabulation perturbs the result
+by ~1 ULP and the chaotic feedback amplifies it, so md5 differs — as everywhere in
+the mean-field path, validation is by **conservation, not byte-identity**. Unlike
+the threaded pieces, the tabulation is **deterministic at a fixed thread count**
+and needs no reproducibility caveats of its own.
 
 ## What was implemented here
 
