@@ -267,20 +267,40 @@ reproducible across thread counts:
 | + Strings (high-energy Collider) | `config.yaml` | 4 | completes (serial fallback) |
 | Single big event | `box_heavy`, 1 ens | 1/2/4/8 | reproducible (Phase 3a, `1a2ac644…`) |
 
-**Mean-field note.** The potentials path is correct and reproducible but does not
-speed up: each time step is dominated by two *serial* steps — the lattice
-accumulation over all ensembles (`update_potentials`/
+**Mean-field note.** The potentials path is correct and reproducible (`b13d927a…`)
+but does not speed up: each time step is dominated by two *serial* steps — the
+lattice accumulation over all ensembles (`update_potentials` →
 `update_lattice_accumulating_ensembles`) and the momentum update
 (`update_momenta`). The wasteful all-ensemble particle-list copy in
-`update_momenta` is now skipped when the lattice is used and neither the
-momentum-dependent nor the outside-lattice force path is active (a pure
-optimization — output unchanged). The momentum-update loop itself was left
-*serial*: its potential-force evaluation (`Potentials::all_forces` /
-`single_particle_energy_gradient`) is not thread-safe (it aborts under threads),
-so a real mean-field speedup needs (a) a thread-safe force evaluation, (b) a
+`update_momenta` is skipped when unused (a pure optimization — output
+unchanged). The momentum-update loop is kept serial.
+
+A real mean-field speedup needs (a) a thread-safe force evaluation, (b) a
 parallel momentum loop, and (c) the per-thread partial-lattice reduction for
-`update_potentials`. That is the scoped mean-field follow-on. (The strings
-follow-on is now implemented — see "Phase 2 strings" below.)
+`update_potentials`. These were **investigated in depth**; the conclusion is that
+it is a research-grade follow-on, not a quick win:
+
+- **(a) is more than the obvious one-liner.** Parallelizing `update_momenta`
+  aborts with `std::bad_function_call`. Root cause: `RootSolver1D::root_eq_`
+  (the equation handed to the momentum-dependent GSL root finder) is a shared
+  **`static`** member — it has to be static so GSL's C callback `gsl_func` can
+  reach it, and the destructor resets it to `nullptr`, so two threads solving at
+  once clobber each other. Making it `thread_local` removes the abort, but it
+  *changes the result*: the potentials collider is **FP-chaotic**, and the
+  thread-local-storage access pattern shifts the codegen/FP-contraction in the
+  root finder by ~1 ULP, which the cascade amplifies — even the serial result
+  and the across-thread reproducibility change. So byte-identity cannot be used
+  to validate any force-path change here; conserved quantities must be used (as
+  for strings), and the thread-safety has to be made FP-neutral.
+- **(b)** a naive parallel momentum loop (with (a)) runs but gives only **~1.24×**
+  and is not bit-reproducible.
+- **(c)** is the actual lever: `update_lattice_accumulating_ensembles` sums every
+  ensemble into one shared lattice serially, which dominates the step. It needs
+  per-thread partial lattices reduced node-wise (memory ×N_threads + a reduction).
+
+The clean committed state keeps the mean-field momentum/lattice updates serial
+(correct, reproducible). The strings follow-on, by contrast, **is implemented** —
+see "Phase 2 strings" below.
 
 ### Phase 2 strings — per-thread Pythia
 
