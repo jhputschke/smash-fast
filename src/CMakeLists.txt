@@ -337,6 +337,47 @@ if(ENABLE_NANOBENCHMARKING)
     endif()
 endif()
 
+# --- GPU mean-field backend ---------------------------------------------------
+# The dispatcher (gpu_backend.cc) is always compiled; exactly one device backend
+# is selected: Metal on Apple, CUDA where a toolkit is found, else a CPU stub.
+# Frameworks/libraries are appended to SMASH_LIBRARIES so every target links them.
+option(SMASH_USE_GPU
+       "Build the GPU mean-field backend (Metal on Apple / CUDA on NVIDIA)." ON)
+set(smash_src ${smash_src} gpu_backend.cc)
+if(SMASH_USE_GPU AND APPLE)
+    find_library(METAL_FRAMEWORK Metal)
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    if(METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+        message(STATUS "SMASH GPU backend: Metal")
+        set(smash_src ${smash_src} gpu_metal.mm)
+        set_source_files_properties(gpu_metal.mm PROPERTIES COMPILE_FLAGS
+                                    "-fobjc-arc")
+        set(SMASH_LIBRARIES ${SMASH_LIBRARIES} ${METAL_FRAMEWORK}
+                            ${FOUNDATION_FRAMEWORK})
+        add_definitions(-DSMASH_GPU_METAL)
+    else()
+        message(STATUS "SMASH GPU backend: none (Metal frameworks not found)")
+        set(smash_src ${smash_src} gpu_none.cc)
+    endif()
+elseif(SMASH_USE_GPU)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        find_package(CUDAToolkit)
+        message(STATUS "SMASH GPU backend: CUDA")
+        set(smash_src ${smash_src} gpu_cuda.cu)
+        set(SMASH_LIBRARIES ${SMASH_LIBRARIES} CUDA::cudart)
+        add_definitions(-DSMASH_GPU_CUDA)
+    else()
+        message(STATUS "SMASH GPU backend: none (no CUDA toolkit found)")
+        set(smash_src ${smash_src} gpu_none.cc)
+    endif()
+else()
+    message(STATUS "SMASH GPU backend: disabled (SMASH_USE_GPU=OFF)")
+    set(smash_src ${smash_src} gpu_none.cc)
+endif()
+
 # this is the "object library" target: compiles the sources only once see
 # https://stackoverflow.com/a/29824424 NOTE: shared libraries need PIC and this is already set for
 # all targets through CMAKE_POSITION_INDEPENDENT_CODE

@@ -29,6 +29,7 @@
 #include "fields.h"
 #include "fluidizationaction.h"
 #include "fourvector.h"
+#include "gpu_backend.h"
 #include "grandcan_thermalizer.h"
 #include "grid.h"
 #include "hypersurfacecrossingfinder.h"
@@ -1053,6 +1054,9 @@ Experiment<Modus>::Experiment(Configuration &config,
                              : false),
       time_step_mode_(config.take(InputKeys::gen_timeStepMode)) {
   logg[LExperiment].info() << *this;
+
+  // Resolve the GPU mean-field path from the config (overridden by SMASH_GPU).
+  gpu::set_config_mode(gpu::mode_from_string(config.take(InputKeys::gen_gpu)));
 
   const bool user_wants_nevents = config.has_value(InputKeys::gen_nevents);
   const bool user_wants_min_nonempty =

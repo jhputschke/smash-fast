@@ -483,6 +483,23 @@ class Potentials {
     return use_momentum_dependence_;
   }
 
+  /** \name Tabulated LRF potential U(p,rho) accessors (for the GPU force
+   * backend, which evaluates the root-find on the device). \see
+   * build_lrf_potential_table(). The table is empty unless momentum dependence
+   * is on. */
+  ///@{
+  bool lrf_table_ready() const { return lrf_pot_table_.ready; }
+  const std::vector<double> &lrf_table_values() const {
+    return lrf_pot_table_.values;
+  }
+  int lrf_table_np() const { return lrf_pot_table_.n_p; }
+  int lrf_table_nrho() const { return lrf_pot_table_.n_rho; }
+  double lrf_table_pmax() const { return lrf_pot_table_.p_max; }
+  double lrf_table_rhomax() const { return lrf_pot_table_.rho_max; }
+  double lrf_table_inv_dp() const { return lrf_pot_table_.inv_dp; }
+  double lrf_table_inv_drho() const { return lrf_pot_table_.inv_drho; }
+  ///@}
+
   /// \return Skyrme parameter skyrme_a, in MeV
   double skyrme_a() const { return skyrme_a_; }
   /// \return Skyrme parameter skyrme_b, in MeV

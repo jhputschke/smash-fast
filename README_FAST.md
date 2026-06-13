@@ -1,9 +1,11 @@
-# SMASH‑fast — Parallel SMASH (OpenMP + GPU prototype)
+# SMASH‑fast — Parallel SMASH (OpenMP + GPU)
 
 This is a parallelized fork of [SMASH](README.md). The physics, inputs, and
 command‑line interface are unchanged; what is added is **shared‑memory
 parallelism (OpenMP)** across the parts of the evolution that dominate runtime,
-plus a verified **GPU prototype** for the GPU‑viable kernels. The guiding
+plus an **integrated GPU backend (Metal/CUDA)** that offloads the mean‑field
+density fill (with standalone GPU kernels for the other GPU‑viable pieces). The
+guiding
 constraint throughout was *reproducibility*: a fixed‑seed run must give the same
 answer regardless of how many threads it uses (the acceptance test that SMASH
 issue #3075 failed).
@@ -28,8 +30,15 @@ detail and transparency.
 | **Ensembles** (no strings) | action *finding* + time‑stepless *performing* over independent ensembles | **3.3× (4t), 5.5–6.5× (8t)** | bit‑identical across thread counts |
 | **Strings** (Pythia, Collider) | **still the ensemble loop** (per‑thread Pythia/`StringProcess`, static schedule) — *not* a separate parallel path | **~2× (8t)** — but only with `Ensembles > 1` **and** strings that actually fire (high √s); otherwise **slower** (see below) | bit‑identical (moderate strings) / conserved to 1.7e‑10 (heavy strings) |
 | **Single big event** (`Ensembles: 1`) | cell‑parallel pair search in action finding | **3.9× (8t)** | bit‑identical across thread counts |
-| **Mean‑field / potentials** | tabulated momentum‑dependent root‑find + node‑parallel *gather* density fill + node‑parallel force loops | **~2.4× (8t)** over the original momentum‑dependent baseline | validated by conservation (FP‑chaotic; see below) |
-| **GPU prototype** (box + stochastic) | propagation + stochastic 2→2 finding on a GPU | **1.4–2× on GB10** (memory‑bound) | reproduces CPU result *exactly* |
+| **Mean‑field / potentials** (CPU) | tabulated momentum‑dependent root‑find + node‑parallel *gather* density fill + node‑parallel force loops | **~2.4× (8t)** over the original momentum‑dependent baseline | validated by conservation (FP‑chaotic; see below) |
+| **GPU mean‑field step** (Metal/CUDA, *integrated*) | the **density fill** *and* the **momentum‑dependent force / root‑find** on the device — the two dominant computes of a **potentials run** | **5.0× (1t), 2.4× (8t)** vs the CPU at the same thread count — **potentials Collider runs only** (see below) | charge & Npart exact, energy to ~5e‑8 vs CPU |
+
+> The GPU row helps **only for mean‑field / potentials runs** (a covariant‑Gaussian
+> density lattice on a non‑periodic Collider lattice). It does **nothing** for runs
+> without potentials, for the box modus (periodic lattice), or for string‑dominated
+> runs — there the CPU paths above are what matter. Standalone GPU kernels for the
+> other GPU‑viable pieces (Phase‑4 box+stochastic finding, **1.4–2× on GB10**;
+> force/root‑find; a resident multi‑step loop) live in [`gpu/`](gpu/).
 
 The serial build (`USE_OPENMP=OFF`) is byte‑for‑byte the original SMASH — every
 `#pragma omp` is a no‑op without OpenMP.
@@ -43,8 +52,10 @@ The serial build (`USE_OPENMP=OFF`) is byte‑for‑byte the original SMASH — 
 Same as upstream SMASH (see [INSTALL.md](INSTALL.md)): a C++17 compiler
 (**GCC ≥ 8** or **Clang ≥ 7** — both ship OpenMP), CMake ≥ 3.16, GSL ≥ 2.0,
 Eigen3 ≥ 3.0, and **Pythia 8.316**. OpenMP comes with the compiler; nothing
-extra to install. The GPU prototype additionally needs a CUDA toolkit and an
-NVIDIA GPU, but it is standalone and not required to build or run SMASH.
+extra to install. The **GPU backend** needs no extra packages: it is built
+automatically when CMake finds Metal (Apple Silicon, system frameworks) or a CUDA
+toolkit + NVIDIA GPU, and otherwise compiles a CPU stub — so SMASH builds and runs
+the same everywhere (`-DSMASH_USE_GPU=OFF` forces the CPU stub).
 
 ### Configure + build
 
@@ -101,6 +112,77 @@ Everything else (config files, `-i/-p/-d`, output, etc.) works exactly as in the
 
 ---
 
+## GPU acceleration (mean‑field step)
+
+When a GPU is present, the two dominant computes of a mean‑field (potentials)
+run — the covariant‑Gaussian **baryon‑density lattice fill** and the
+**momentum‑dependent force / root‑find** (the device `update_momenta`) — can run
+on the device.
+The backend is pure C++/Metal/CUDA (no Python/MLX) and is selected automatically
+by CMake at configure time: **Metal** on Apple Silicon, **CUDA** where an `nvcc`
+toolkit is found, otherwise a CPU stub. Look for the configure line
+`-- SMASH GPU backend: Metal` (or `CUDA` / `none`); pass `-DSMASH_USE_GPU=OFF` to
+force the CPU build.
+
+Control at run time (default is **auto**: use the GPU when a device is detected):
+
+```bash
+# environment variable (overrides the config key)
+SMASH_GPU=on   ./build/smash -i config.yaml    # require the GPU (warn+fallback if absent)
+SMASH_GPU=off  ./build/smash -i config.yaml    # force the CPU path
+SMASH_GPU=auto ./build/smash -i config.yaml    # default: GPU if present
+
+# or in the YAML config
+General:
+    Gpu: auto      # auto | on | off
+```
+
+At startup SMASH prints e.g. `[GPU] mean-field path: ENABLED (backend metal, mode
+auto)`.
+
+### When the GPU actually helps
+
+The GPU path offloads the mean‑field **density fill** and **force**. It therefore
+helps **only when those dominate the runtime**, i.e. a **potentials / mean‑field
+Collider run**. Concretely the **density fill** runs on the GPU when **all** of
+these hold (otherwise it silently stays on the CPU):
+
+- `Potentials:` are configured (so a density lattice is built every step), **and**
+- smearing is **Covariant Gaussian** (`Smearing_Mode: Covariant Gaussian`, the
+  default for potentials), **and**
+- the lattice is **non‑periodic** — i.e. the **Collider** modus, *not* a box.
+
+The **force** additionally runs on the GPU only with **momentum‑dependent**
+Skyrme potentials (`Momentum_Dependence:`) and no VDF / Coulomb / out‑of‑lattice
+potentials; otherwise the (OpenMP‑parallel) CPU force is used while the density
+fill still runs on the GPU.
+
+> **The force offload helps mainly at low thread counts.** The CPU force loop is
+> already OpenMP‑parallel, so the GPU force is a big win at 1 thread (≈1.8× of the
+> mean‑field evolution) but only marginal at 8–16 threads (≈1.05–1.1×), where the
+> CPU force is already small. It is never slower in our measurements, but if you
+> run many CPU threads you can keep the gather on the GPU and the force on the CPU
+> with `SMASH_GPU_FORCE=off` (the gather is where most of the GPU win comes from).
+
+It gives **no benefit** for runs without potentials, for the **box** modus
+(periodic lattice → the gather, and hence the GPU path, is never used), or for
+**string‑dominated** runs (Pythia on the CPU sets the floor). The collision
+finding, strings, decays and RNG always stay on the CPU.
+
+The benefit is **largest at low thread counts**, because the CPU alternatives
+already scale with OpenMP: on an M3 Max with the SIS `verify/potentials_md.yaml`
+benchmark the mean‑field evolution is **5.0× faster at 1 thread** (27.4 s → 5.5 s)
+and still **2.4× faster at 8 threads** (10.3 s → 4.3 s) with the GPU on — so the
+GPU is most attractive when you have **few CPU threads, a large lattice, and many
+test‑particles**. Charge and particle number are unchanged and total energy agrees
+to ~5e‑8 vs the CPU path.
+
+Standalone GPU kernels (gather, force/root‑find, a resident multi‑step loop) and
+their CUDA companions live in [`gpu/`](gpu/); design notes are in
+[`PotentialNextSteps.md`](PotentialNextSteps.md) §3.
+
+---
+
 ## What improves, and under which settings
 
 The parallel path that engages depends on a few configuration knobs. This is the
@@ -115,6 +197,7 @@ Pythia 8.316; "evolution time" excludes the one‑time serial cache warm‑up):
 | **`Strings: True`, `Ensembles: 1`** *or* **low‑energy Collider** (strings never fire) | nothing parallelizes — one ensemble = no work to split, yet `OMP_NUM_THREADS` Pythia instances are still built; the strings flag also **disables** the cell‑parallel finder | **< 1× (slower than 1 thread)** | the common trap, e.g. Au+Au at `E_Kin: 1.23` GeV. Fix: set `Strings: False` (physically identical at that energy) and/or raise `Ensembles` — see callout below |
 | **`Ensembles: 1`, `Strings: False`, non‑stochastic criterion** | cell‑parallel pair search | 1.65× (2t), 2.66× (4t), 3.9× (8t) | `verify/box_heavy.yaml` with 1 ensemble |
 | **`Potentials:` (mean field)** | tabulated root‑find (deterministic) + **gather density fill for ≥ 4 threads** + node‑parallel force loops | 1.13× (1t, tabulation only), 1.54× (4t), **2.43× (8t)** | `input/potentials`, `verify/potentials_nomd.yaml`, `verify/potentials_md.yaml` |
+| **`Potentials:` + GPU detected** (Collider, Covariant Gaussian, `Gpu: auto`) | density lattice fill **and** (with `Momentum_Dependence:`) the force / root‑find offloaded to **Metal/CUDA** | **5.0× (1t), 2.4× (8t)** over the CPU mean‑field path at the same thread count *(M3 Max)* | engages **only** for non‑periodic (Collider) potentials runs with Covariant Gaussian smearing — box modus and non‑potentials runs are unaffected. `verify/potentials_md.yaml` |
 
 Key mean‑field detail: the density smearing switches from the serial **scatter**
 to the node‑parallel **gather** only when **≥ 4 threads** are available (the

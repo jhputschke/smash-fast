@@ -61,6 +61,48 @@ std::pair<double, ThreeVector> unnormalized_smearing_factor(
   return std::make_pair(sf, sf_grad);
 }
 
+std::pair<double, ThreeVector> unnormalized_smearing_factor_fp32(
+    const ThreeVector &r, const FourVector &p, const double m_inv,
+    const DensityParameters &dens_par, const bool compute_gradient) {
+  /* FP32-emulated twin of unnormalized_smearing_factor(): every per-pair
+   * intermediate (distance, Lorentz boost, exp, gradient) is computed in
+   * `float`, i.e. the arithmetic a Blackwell FP32 GPU kernel would do. The
+   * returned contribution is widened back to double so the caller still
+   * accumulates per node in FP64 -- the mixed-precision design recommended for
+   * the GPU gather (see PotentialNextSteps.md 3a). Used only when the
+   * SMASH_FP32_SMEAR toggle is set, for the precision-drift study (3b). The
+   * boost cancellation lives in r_rest_sqr; this is where the gamma caveat
+   * (large-gamma loss of significance) would first show up. */
+  const float rx = static_cast<float>(r[0]);
+  const float ry = static_cast<float>(r[1]);
+  const float rz = static_cast<float>(r[2]);
+  const float r_sqr = rx * rx + ry * ry + rz * rz;
+  const float r_cut_sqr = static_cast<float>(dens_par.r_cut_sqr());
+  if (r_sqr > r_cut_sqr) {
+    return std::make_pair(0.0, ThreeVector(0.0, 0.0, 0.0));
+  }
+  const float minv = static_cast<float>(m_inv);
+  const float u0 = static_cast<float>(p[0]) * minv;
+  const float ux = static_cast<float>(p[1]) * minv;
+  const float uy = static_cast<float>(p[2]) * minv;
+  const float uz = static_cast<float>(p[3]) * minv;
+  const float u_r = rx * ux + ry * uy + rz * uz;
+  const float r_rest_sqr = r_sqr + u_r * u_r;
+  if (r_rest_sqr > r_cut_sqr) {
+    return std::make_pair(0.0, ThreeVector(0.0, 0.0, 0.0));
+  }
+  const float two_sig_inv = static_cast<float>(dens_par.two_sig_sqr_inv());
+  const float sf = std::exp(-r_rest_sqr * two_sig_inv) * u0;
+  ThreeVector sf_grad(0.0, 0.0, 0.0);
+  if (compute_gradient) {
+    const float c = sf * two_sig_inv * 2.0f;
+    sf_grad = ThreeVector(static_cast<double>(c * (rx + ux * u_r)),
+                          static_cast<double>(c * (ry + uy * u_r)),
+                          static_cast<double>(c * (rz + uz * u_r)));
+  }
+  return std::make_pair(static_cast<double>(sf), sf_grad);
+}
+
 /// \copydoc smash::current_eckart
 template <typename /*ParticlesContainer*/ T>
 std::tuple<double, FourVector, ThreeVector, ThreeVector, FourVector, FourVector,

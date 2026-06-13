@@ -1584,6 +1584,25 @@ struct InputKeys {
       InputSections::general + "Use_Grid", true, {"0.80"}};
 
   /*!\Userguide
+   * \page doxypage_input_conf_general
+   * \optional_key{key_gen_gpu_,Gpu,string,"auto"}
+   *
+   * Controls the GPU mean-field path (covariant Gaussian density fill on a
+   * Metal/CUDA device), if a GPU backend was compiled in.
+   * - `"auto"` &rarr; use the GPU when a device is detected (the default).
+   * - `"on"` &rarr; require the GPU (warn and fall back to the CPU if absent).
+   * - `"off"` &rarr; always use the CPU.
+   *
+   * The environment variable `SMASH_GPU` (`auto`/`on`/`off`), if set, overrides
+   * this key.
+   */
+  /**
+   * \see_key{key_gen_gpu_}
+   */
+  inline static const Key<std::string> gen_gpu{
+      InputSections::general + "Gpu", "auto", {"3.3"}};
+
+  /*!\Userguide
    * \page doxypage_input_conf_logging
    * <hr>
    * <h3> Setting the default for all logging areas </h3>
@@ -6098,6 +6117,7 @@ struct InputKeys {
       std::cref(gen_timeStepMode),
       std::cref(gen_smearingTriangularRange),
       std::cref(gen_useGrid),
+      std::cref(gen_gpu),
       std::cref(log_default),
       std::cref(log_box),
       std::cref(log_collider),
