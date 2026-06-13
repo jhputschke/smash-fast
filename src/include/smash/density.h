@@ -10,6 +10,7 @@
 #define SRC_INCLUDE_SMASH_DENSITY_H_
 
 #include <array>
+#include <cstdlib>
 #include <iostream>
 #include <tuple>
 #include <typeinfo>
@@ -206,6 +207,29 @@ class DensityParameters {
 std::pair<double, ThreeVector> unnormalized_smearing_factor(
     const ThreeVector &r, const FourVector &p, const double m_inv,
     const DensityParameters &dens_par, const bool compute_gradient = false);
+
+/**
+ * FP32-emulated version of unnormalized_smearing_factor(): identical formula
+ * with every per-pair intermediate evaluated in `float`, the result widened
+ * back to double for an FP64 accumulator (mixed precision). Used only by the
+ * gather when fp32_smearing_enabled() is true, for the precision-drift study
+ * (see PotentialNextSteps.md 3b). \copydetails unnormalized_smearing_factor
+ */
+std::pair<double, ThreeVector> unnormalized_smearing_factor_fp32(
+    const ThreeVector &r, const FourVector &p, const double m_inv,
+    const DensityParameters &dens_par, const bool compute_gradient = false);
+
+/**
+ * Study toggle (env var `SMASH_FP32_SMEAR`, read once): when set, the
+ * node-parallel covariant gather evaluates the per-pair smearing in emulated
+ * FP32 instead of FP64. This is a research switch for the precision-drift study
+ * gating GPU FP32 work, not a physics config option.
+ * \return whether emulated-FP32 smearing is enabled.
+ */
+inline bool fp32_smearing_enabled() {
+  static const bool enabled = (std::getenv("SMASH_FP32_SMEAR") != nullptr);
+  return enabled;
+}
 
 /**
  * Calculates Eckart rest frame density and 4-current of a given density type
@@ -709,6 +733,9 @@ void update_lattice_gather_covariant(RectangularLattice<T> *lat,
   const double norm_factor_gaus = par.norm_factor_sf();
   const bool do_derivatives =
       par.derivatives() == DerivativesMode::CovariantGaussian;
+  // Precision-drift study toggle (3b): emulated-FP32 per-pair smearing, FP64
+  // accumulate. Cached bool, hoisted out of the hot loop.
+  const bool fp32_smear = fp32_smearing_enabled();
 
   // Collect contributing particles, their smearing inputs, and their exact
   // smearing-cube node boxes (boxes kept parallel to sources, bin-sorted below).
@@ -886,8 +913,13 @@ void update_lattice_gather_covariant(RectangularLattice<T> *lat,
               continue;  // node not in this particle's smearing cube
             }
             const GatherSource &s = ssrc[k];
-            const auto sf = unnormalized_smearing_factor(
-                s.pos - r, s.p_mu, s.m_inv, par, compute_gradient);
+            const auto sf =
+                fp32_smear ? unnormalized_smearing_factor_fp32(
+                                 s.pos - r, s.p_mu, s.m_inv, par,
+                                 compute_gradient)
+                           : unnormalized_smearing_factor(
+                                 s.pos - r, s.p_mu, s.m_inv, par,
+                                 compute_gradient);
             node.add_particle(*s.part, sf.first * s.common_weight);
             if (do_derivatives) {
               node.add_particle_for_derivatives(*s.part, s.dens_factor,

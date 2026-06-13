@@ -268,6 +268,64 @@ Energy-dependence caveat: the covariant boost has `γ²/(1+γ)` cancellations; F
 is safe at SIS (`γ≈1.3`) but degrades for relativistic (large-`γ`) systems, so the
 verdict is config-dependent and the study should sweep beam energy.
 
+#### 3b results (measured 2026-06-12) — FP32 clears the gate at SIS
+
+Implemented the emulated-FP32 path: [`unnormalized_smearing_factor_fp32()`](src/density.cc)
+evaluates every per-pair intermediate (distance, Lorentz boost, `exp`, gradient)
+in `float` and widens back to `double` for the FP64 node accumulator — the
+recommended **mixed-precision** GPU design. It is gated in the node-parallel
+gather by an env toggle `SMASH_FP32_SMEAR=1` ([`fp32_smearing_enabled()`](src/include/smash/density.h)),
+a study switch, not a physics config option. Benchmark
+[`verify/potentials_md.yaml`](verify/potentials_md.yaml), T=8 (gather path), M3 Max.
+
+**The reference scale: FP64 is itself non-deterministic run-to-run.** Two
+identical FP64 invocations (same seed 12345, same 8 threads) gave **ΔETotal ≈ 0.13
+GeV, ΔNpart ≈ 6** (`dcba01…` vs `23b3ea…`) — the thread-scheduling chaos in the
+*parallel collision finding* (unrelated to the mean field; the density gather and
+force are deterministic, §1c). Any FP32 effect must be judged against this band.
+
+**Seed sweep, FP32-emulated vs FP64 (4 seeds):**
+
+| seed | ΔETotal (FP32−FP64) | ΔNpart | D(ETot/N): FP64 → FP32 |
+|---|---|---|---|
+| 12345 | +0.03 GeV | −12 | 0.000747 → 0.000749 |
+| 222 | **0 (bit-identical)** | 0 | 0.000722 → 0.000722 |
+| 777 | +0.003 GeV | +5 | 0.000741 → 0.000741 |
+| 31337 | **0 (bit-identical)** | 0 | 0.000817 → 0.000817 |
+
+- **Charge: exact** (`Q_tot` diff 0 — conserved per vertex, FP-independent).
+- **Energy conservation unchanged:** `D(ETot/N)` ≈ 8×10⁻⁴ for both; FP32 shifts it
+  by ≤2×10⁻⁶. FP32 does **not** degrade conservation.
+- **No detectable bias:** the FP32 deviations (0 … 0.03 GeV) are *smaller* than
+  FP64's own run-to-run noise (0.13 GeV) and ~200× below the seed-to-seed ETotal
+  scatter (~6 GeV across these seeds). For 2 of 4 seeds FP32 was bit-identical to
+  FP64. → **FP32 is indistinguishable from re-running FP64 at SIS.**
+
+**Beam-energy (γ) sweep confirms the caveat** (seed 12345, FP32 vs FP64):
+
+| E_Kin | γ_beam | ΔETotal rel | ΔNpart rel | D(ETot/N) FP64 → FP32 |
+|---|---|---|---|---|
+| 1.23 (SIS) | ~2.3 | 1×10⁻⁷ | 0 | 0.00075 → 0.00075 |
+| 4.0 | ~5.3 | 4.5×10⁻⁵ | 9×10⁻⁴ | −0.00749 → −0.00755 |
+| 12.0 | ~14 | 8×10⁻⁵ | 2.5×10⁻³ | −0.0112 → −0.0111 |
+
+The FP32-vs-FP64 spread **grows with γ** exactly as the `γ²/(1+γ)` cancellation
+argument predicts, but stays modest (energy rel ≤10⁻⁴) and conservation
+(`D(ETot/N)`, dominated here by the mean-field integrator being used outside its
+SIS regime) is unchanged FP32-vs-FP64 at every energy. *Caveats on the high-E
+points:* denser collisions inflate the thread-chaos baseline too, and `E_Kin=12`
+can push `p_LRF` toward the tabulation grid clamp (§2) — so these are a
+qualitative trend, not a clean attribution.
+
+**Verdict.** The FP32 gate is **passed for SIS / mean-field-dominated configs**:
+charge exact, conservation unchanged, bulk-observable drift below the existing
+multi-thread nondeterminism, no bias. This **unblocks the FP32 GPU density gather
+(§3a)** for SIS production. For relativistic (large-γ) production, re-run this
+toggle at the target energy first, or keep the boost / `r_rest_sqr` term in FP64
+while doing the `exp` in FP32. Remaining nice-to-haves: the pure-`float`
+*accumulator* worst-case variant, and ensemble-averaged spectra / `v1`,`v2` bias
+(the conserved-quantity and bulk-count tests here already show no bias to ~10⁻⁴).
+
 ### 3c. Hybrid GPU/CPU mean-field step
 
 Phase 4's key finding was that the win only appears when data is **device-resident
@@ -342,8 +400,8 @@ brent loop entirely on device. Naturally rides along with 3c.
 1. ~~**Parallelize `update_momenta` (thread-safe force eval)**~~ — **done (§1c)**: bit-identical, +1.27× evolution at T=8 (1.33× at T=12), and it unblocks the GPU force kernel. *(was the measured serial bottleneck)*
 2. **Engineering wins**: ✅ gather *bounding box* + buffer *reserve* done (§1c, bit-identical); *still open* — gather over-inclusion bin tuning, cross-step buffer persistence, tabulation polish. *(low risk; remaining bin-tuning needs a conservation check)*
 3. **Event-level parallelism** harness. *(biggest production lever, independent of the above; also sidesteps the ~18 s single-threaded startup by amortizing it)*
-4. **FP32 precision-drift study on CPU** (§3b). *(cheap, gates all GPU FP32 work)*
-5. If §4 passes: **FP32 hybrid GPU mean-field step** (§3a/3c/3d) for mean-field-dominated production — needs the §1 thread-safe force first. *(research-grade)*
+4. ~~**FP32 precision-drift study on CPU**~~ — **done (§3b)**: passed at SIS (charge exact, conservation unchanged, drift below the multi-thread noise, no bias); deviation grows with γ so re-check before relativistic production. *(gate cleared for SIS/mean-field-dominated GPU FP32)*
+5. **§4 passed → FP32 hybrid GPU mean-field step** (§3a/3c/3d) for mean-field-dominated production — has the §1 thread-safe force; the emulated-FP32 gather (`SMASH_FP32_SMEAR`) is the CPU dry-run of the §3a kernel. *(research-grade; now unblocked)*
 6. Opportunistic: Pauli grid pre-cull **only for collision-dominated configs** (subleading here, §1b/§4), deterministic reductions, incremental/adaptive lattice, disk-cached spectral tabulation. *(research-grade)*
 
 The throughline: the tabulation and gather already turned the mean-field path from
