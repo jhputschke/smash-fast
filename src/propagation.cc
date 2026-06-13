@@ -154,84 +154,102 @@ void update_momenta(
       plist.insert(plist.end(), tmp.begin(), tmp.end());
     }
   }
-  std::pair<ThreeVector, ThreeVector> FB, FI3, EM_fields;
   double min_time_scale = std::numeric_limits<double>::infinity();
 
-  /* NOTE: this momentum-update loop is kept serial. Although it is independent
-   * per particle given the lattice, the potential force evaluation
-   * (Potentials::all_forces / single_particle_energy_gradient) is not currently
-   * thread-safe (it aborts under threads), so parallelizing it together with a
-   * thread-safe force evaluation and a parallel lattice reduction is left as the
-   * mean-field follow-on. The wasteful all-ensemble plist copy above is now
-   * skipped when unused, which removes the main avoidable serial cost here. */
+  /* The momentum update is independent per particle given the (read-only)
+   * force/density lattices: each particle reads the lattices and its own state
+   * and writes only its own momentum. The force evaluation is now thread-safe
+   * (RootSolver1D keeps its GSL callback in thread_local state, see
+   * rootsolver.h), so the loop is parallelized over a flat list of the
+   * force-affected particles across all ensembles. min_time_scale is an
+   * order-independent min reduction and no cross-particle accumulation is
+   * reordered, so the result is bit-identical to the serial loop at any thread
+   * count. (The only non-reproducible path is the root-finder's random scan
+   * fallback in calculation_frame_energy, which is not exercised when the
+   * U(p,rho) table covers the sampled range.) */
+  std::vector<ParticleData *> work;
+  size_t ntot = 0;
+  for (Particles &particles : ensembles) {
+    ntot += particles.size();
+  }
+  work.reserve(ntot);
   for (Particles &particles : ensembles) {
     for (ParticleData &data : particles) {
-      // Only baryons and nuclei will be affected by the potentials
-      if (!(data.is_baryon() || data.is_nucleus())) {
-        continue;
-      }
-      const auto scale = pot.force_scale(data.type());
-      const ThreeVector r = data.position().threevec();
-      /* Lattices can be used for calculation if 1-2 are fulfilled:
-       * 1) Required lattices are not nullptr - possibly_use_lattice
-       * 2) r is not out of required lattices */
-      const bool use_lattice =
-          possibly_use_lattice &&
-          (pot.use_skyrme() ? FB_lat->value_at(r, FB) : true) &&
-          (pot.use_vdf() ? FB_lat->value_at(r, FB) : true) &&
-          (pot.use_symmetry() ? FI3_lat->value_at(r, FI3) : true);
-      if (!use_lattice && !pot.use_potentials_outside_lattice()) {
-        continue;
-      }
-      if (!pot.use_skyrme() && !pot.use_vdf()) {
-        FB = std::make_pair(ThreeVector(0., 0., 0.), ThreeVector(0., 0., 0.));
-      }
-      if (!pot.use_symmetry()) {
-        FI3 = std::make_pair(ThreeVector(0., 0., 0.), ThreeVector(0., 0., 0.));
-      }
-      if (!use_lattice) {
-        const auto tmp = pot.all_forces(r, plist);
-        FB = std::make_pair(std::get<0>(tmp), std::get<1>(tmp));
-        FI3 = std::make_pair(std::get<2>(tmp), std::get<3>(tmp));
-      }
-      ThreeVector force = std::invoke([&]() {
-        if (pot.use_momentum_dependence()) {
-          const ThreeVector energy_grad = pot.single_particle_energy_gradient(
-              jB_lat, data.position().threevec(), data.momentum().threevec(),
-              data.effective_mass(), plist);
-          return -energy_grad * scale.first +
-                 scale.second * data.type().isospin3_rel() *
-                     (FI3.first +
-                      data.momentum().velocity().cross_product(FI3.second));
-        } else {
-          return scale.first *
-                     (FB.first +
-                      data.momentum().velocity().cross_product(FB.second)) +
-                 scale.second * data.type().isospin3_rel() *
-                     (FI3.first +
-                      data.momentum().velocity().cross_product(FI3.second));
-        }
-      });
-      // Potentially add Lorentz force
-      if (pot.use_coulomb() && EM_lat->value_at(r, EM_fields)) {
-        // factor hbar*c to convert fields from 1/fm^2 to GeV/fm
-        force += hbarc * data.type().charge() * elementary_charge *
-                 (EM_fields.first +
-                  data.momentum().velocity().cross_product(EM_fields.second));
-      }
-      logg[LPropagation].debug("Update momenta: F [GeV/fm] = ", force);
-      data.set_4momentum(data.effective_mass(),
-                         data.momentum().threevec() + force * dt);
+      work.push_back(&data);
+    }
+  }
+  const int n_work = static_cast<int>(work.size());
 
-      // calculate the time scale of the change in momentum
-      const double Force_abs = force.abs();
-      if (Force_abs < really_small) {
-        continue;
+#pragma omp parallel for schedule(static) reduction(min : min_time_scale)
+  for (int widx = 0; widx < n_work; widx++) {
+    ParticleData &data = *work[widx];
+    // Only baryons and nuclei will be affected by the potentials
+    if (!(data.is_baryon() || data.is_nucleus())) {
+      continue;
+    }
+    // Per-iteration (per-thread) scratch for the field values read below.
+    std::pair<ThreeVector, ThreeVector> FB, FI3, EM_fields;
+    const auto scale = pot.force_scale(data.type());
+    const ThreeVector r = data.position().threevec();
+    /* Lattices can be used for calculation if 1-2 are fulfilled:
+     * 1) Required lattices are not nullptr - possibly_use_lattice
+     * 2) r is not out of required lattices */
+    const bool use_lattice =
+        possibly_use_lattice &&
+        (pot.use_skyrme() ? FB_lat->value_at(r, FB) : true) &&
+        (pot.use_vdf() ? FB_lat->value_at(r, FB) : true) &&
+        (pot.use_symmetry() ? FI3_lat->value_at(r, FI3) : true);
+    if (!use_lattice && !pot.use_potentials_outside_lattice()) {
+      continue;
+    }
+    if (!pot.use_skyrme() && !pot.use_vdf()) {
+      FB = std::make_pair(ThreeVector(0., 0., 0.), ThreeVector(0., 0., 0.));
+    }
+    if (!pot.use_symmetry()) {
+      FI3 = std::make_pair(ThreeVector(0., 0., 0.), ThreeVector(0., 0., 0.));
+    }
+    if (!use_lattice) {
+      const auto tmp = pot.all_forces(r, plist);
+      FB = std::make_pair(std::get<0>(tmp), std::get<1>(tmp));
+      FI3 = std::make_pair(std::get<2>(tmp), std::get<3>(tmp));
+    }
+    ThreeVector force = std::invoke([&]() {
+      if (pot.use_momentum_dependence()) {
+        const ThreeVector energy_grad = pot.single_particle_energy_gradient(
+            jB_lat, data.position().threevec(), data.momentum().threevec(),
+            data.effective_mass(), plist);
+        return -energy_grad * scale.first +
+               scale.second * data.type().isospin3_rel() *
+                   (FI3.first +
+                    data.momentum().velocity().cross_product(FI3.second));
+      } else {
+        return scale.first *
+                   (FB.first +
+                    data.momentum().velocity().cross_product(FB.second)) +
+               scale.second * data.type().isospin3_rel() *
+                   (FI3.first +
+                    data.momentum().velocity().cross_product(FI3.second));
       }
-      const double time_scale = data.momentum().x0() / Force_abs;
-      if (time_scale < min_time_scale) {
-        min_time_scale = time_scale;
-      }
+    });
+    // Potentially add Lorentz force
+    if (pot.use_coulomb() && EM_lat->value_at(r, EM_fields)) {
+      // factor hbar*c to convert fields from 1/fm^2 to GeV/fm
+      force += hbarc * data.type().charge() * elementary_charge *
+               (EM_fields.first +
+                data.momentum().velocity().cross_product(EM_fields.second));
+    }
+    logg[LPropagation].debug("Update momenta: F [GeV/fm] = ", force);
+    data.set_4momentum(data.effective_mass(),
+                       data.momentum().threevec() + force * dt);
+
+    // calculate the time scale of the change in momentum
+    const double Force_abs = force.abs();
+    if (Force_abs < really_small) {
+      continue;
+    }
+    const double time_scale = data.momentum().x0() / Force_abs;
+    if (time_scale < min_time_scale) {
+      min_time_scale = time_scale;
     }
   }
   // warn if the time step is too big

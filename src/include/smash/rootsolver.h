@@ -99,9 +99,17 @@ class RootSolver1D {
    * class instance, it is not possible to use non-static members inside them
    * (non-static members \b are bound to a class instance). \see gsl_func to
    * understand why that method needs to be \c static as well.
+   *
+   * It is additionally \c thread_local so that concurrent root solves on
+   * different threads each keep their own callback. Without this, parallel
+   * force evaluation (the mean-field momentum update) would have all threads
+   * share — and clobber — this single pointer, so a thread's GSL iteration
+   * could call another thread's equation. The solver is constructed, used and
+   * destroyed on one thread (GSL never crosses threads), so per-thread state is
+   * correct. \see update_momenta() in propagation.cc.
    */
-  static inline std::unique_ptr<std::function<double(double)>> root_eq_ =
-      nullptr;
+  static inline thread_local std::unique_ptr<std::function<double(double)>>
+      root_eq_ = nullptr;
 
   /// Expected precision of the root
   double solution_precision_ = 1e-7;

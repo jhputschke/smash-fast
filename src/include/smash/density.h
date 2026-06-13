@@ -712,8 +712,19 @@ void update_lattice_gather_covariant(RectangularLattice<T> *lat,
 
   // Collect contributing particles, their smearing inputs, and their exact
   // smearing-cube node boxes (boxes kept parallel to sources, bin-sorted below).
+  // Reserve up front (one allocation) to avoid per-step push_back growth, and
+  // track the global node bounding box [gl, gu) of all smearing cubes so the
+  // node loop below can skip the (usually large) empty region of the lattice.
   std::vector<GatherSource> sources;
   std::vector<GatherBox> boxes;
+  size_t ntot = 0;
+  for (const Particles &particles : ensembles) {
+    ntot += particles.size();
+  }
+  sources.reserve(ntot);
+  boxes.reserve(ntot);
+  std::array<int, 3> gl = {n_cells[0], n_cells[1], n_cells[2]};
+  std::array<int, 3> gu = {0, 0, 0};
   for (const Particles &particles : ensembles) {
     for (const ParticleData &part : particles) {
       if (par.only_participants() &&
@@ -765,6 +776,14 @@ void update_lattice_gather_covariant(RectangularLattice<T> *lat,
       s.part = &part;
       sources.push_back(s);
       boxes.push_back(box);
+      for (int i = 0; i < 3; i++) {
+        if (box.l[i] < gl[i]) {
+          gl[i] = box.l[i];
+        }
+        if (box.u[i] > gu[i]) {
+          gu[i] = box.u[i];
+        }
+      }
     }
   }
   const int n_src = static_cast<int>(sources.size());
@@ -820,14 +839,26 @@ void update_lattice_gather_covariant(RectangularLattice<T> *lat,
 
   // Node-parallel gather. Each node owns its writes; schedule(dynamic) balances
   // the clustered load without affecting the (fixed) per-node summation order.
+  // Only the occupied bounding box [gl, gu) is visited: nodes outside it receive
+  // no contribution from any particle (already zeroed by lat->reset()), so this
+  // skips the empty lattice region (the vast majority in a collision) with no
+  // change to the result. The iteration order over the box differs from the full
+  // lattice, but per-node ownership keeps the lattice bit-identical.
   const int nx = n_cells[0], ny = n_cells[1];
-  const int n_nodes = nx * ny * n_cells[2];
+  const int bxn = gu[0] - gl[0];
+  const int byn = gu[1] - gl[1];
+  const int bzn = gu[2] - gl[2];
+  const long n_box = static_cast<long>(bxn) * byn * bzn;
 #pragma omp parallel for schedule(dynamic, 512)
-  for (int node_i = 0; node_i < n_nodes; node_i++) {
-    const int ix = node_i % nx;
-    const int rem = node_i / nx;
-    const int iy = rem % ny;
-    const int iz = rem / ny;
+  for (long t = 0; t < n_box; t++) {
+    const int lx = static_cast<int>(t % bxn);
+    const long rem_l = t / bxn;
+    const int ly = static_cast<int>(rem_l % byn);
+    const int lz = static_cast<int>(rem_l / byn);
+    const int ix = gl[0] + lx;
+    const int iy = gl[1] + ly;
+    const int iz = gl[2] + lz;
+    const int node_i = ix + nx * (iy + ny * iz);
     const int bx0 = ix / B[0], by0 = iy / B[1], bz0 = iz / B[2];
     T &node = (*lat)[node_i];
     const ThreeVector r = lat->cell_center(ix, iy, iz);
