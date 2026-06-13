@@ -157,6 +157,13 @@ Skyrme potentials (`Momentum_Dependence:`) and no VDF / Coulomb / out‑of‑lat
 potentials; otherwise the (OpenMP‑parallel) CPU force is used while the density
 fill still runs on the GPU.
 
+> **The force offload helps mainly at low thread counts.** The CPU force loop is
+> already OpenMP‑parallel, so the GPU force is a big win at 1 thread (≈1.8× of the
+> mean‑field evolution) but only marginal at 8–16 threads (≈1.05–1.1×), where the
+> CPU force is already small. It is never slower in our measurements, but if you
+> run many CPU threads you can keep the gather on the GPU and the force on the CPU
+> with `SMASH_GPU_FORCE=off` (the gather is where most of the GPU win comes from).
+
 It gives **no benefit** for runs without potentials, for the **box** modus
 (periodic lattice → the gather, and hence the GPU path, is never used), or for
 **string‑dominated** runs (Pythia on the CPU sets the floor). The collision

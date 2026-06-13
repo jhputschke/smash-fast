@@ -88,6 +88,16 @@ bool enabled() {
   return result;
 }
 
+bool force_enabled() {
+  if (!enabled()) {
+    return false;
+  }
+  if (const char *e = std::getenv("SMASH_GPU_FORCE")) {
+    return mode_from_string(e) != Mode::Off;
+  }
+  return true;
+}
+
 bool run_gather(const GatherJob &job) { return detail::backend_gather(job); }
 
 bool run_force(const ForceJob &job) { return detail::backend_force(job); }

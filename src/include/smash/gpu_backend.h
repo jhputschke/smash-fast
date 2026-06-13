@@ -46,6 +46,15 @@ const char *backend_name();
 bool enabled();
 
 /**
+ * \return whether the GPU **force** path (the device update_momenta) should be
+ * used. This is enabled() AND the per-kernel env override \c SMASH_GPU_FORCE
+ * (\c off disables only the force, leaving the gather on the GPU) — a diagnostic
+ * knob, since the GPU force only wins clearly at low CPU-thread counts (the CPU
+ * force is already OpenMP-parallel).
+ */
+bool force_enabled();
+
+/**
  * Plain-data description of one covariant-Gaussian density-gather call, so the
  * Metal/CUDA backends stay free of SMASH headers. Positions/momenta are a
  * structure-of-arrays of the contributing particles (all ensembles); the

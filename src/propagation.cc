@@ -290,7 +290,7 @@ void update_momenta(
   // on the device when a backend is enabled and the case is supported (Skyrme +
   // momentum dependence + optional symmetry; lattice currents present; no VDF /
   // Coulomb / outside-lattice fallback). Falls back to the CPU loop otherwise.
-  if (gpu::enabled() && pot.use_momentum_dependence() && !pot.use_vdf() &&
+  if (gpu::force_enabled() && pot.use_momentum_dependence() && !pot.use_vdf() &&
       !pot.use_coulomb() && !pot.use_potentials_outside_lattice() &&
       possibly_use_lattice && jB_lat != nullptr && pot.lrf_table_ready()) {
     if (update_momenta_on_gpu(ensembles, dt, pot, FI3_lat, jB_lat)) {
