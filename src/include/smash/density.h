@@ -10,9 +10,11 @@
 #define SRC_INCLUDE_SMASH_DENSITY_H_
 
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <tuple>
+#include <type_traits>
 #include <typeinfo>
 #include <utility>
 #include <vector>
@@ -25,6 +27,7 @@
 #include "experimentparameters.h"
 #include "forwarddeclarations.h"
 #include "fourvector.h"
+#include "gpu_backend.h"
 #include "lattice.h"
 #include "particledata.h"
 #include "particles.h"
@@ -374,6 +377,23 @@ class DensityOnLattice {
       djmu_dxnu_[k] += factor * PartFourVelocity * sf_grad[k - 1];
       djmu_dxnu_[0] -=
           factor * PartFourVelocity * sf_grad[k - 1] * part.velocity()[k - 1];
+    }
+  }
+
+  /**
+   * Overwrite the accumulated currents of this node directly from a GPU gather
+   * (\see gpu::run_gather). The 24 values are the sum over all particles of the
+   * same per-pair contributions that add_particle()/add_particle_for_derivatives()
+   * fold in: `v[0..3]` = jmu_pos, `v[4..7]` = jmu_neg, `v[8..23]` =
+   * djmu_dxnu[0..3]. Replaces (does not add to) the node, so it is called once
+   * after lat->reset() instead of the per-particle loop.
+   */
+  void set_currents_from_gpu(const float *v) {
+    jmu_pos_ = FourVector(v[0], v[1], v[2], v[3]);
+    jmu_neg_ = FourVector(v[4], v[5], v[6], v[7]);
+    for (int k = 0; k < 4; k++) {
+      djmu_dxnu_[k] =
+          FourVector(v[8 + 4 * k], v[9 + 4 * k], v[10 + 4 * k], v[11 + 4 * k]);
     }
   }
 
@@ -944,6 +964,159 @@ void update_lattice_gather_covariant(RectangularLattice<T> *lat,
  * \param[in] compute_gradient Whether to compute the gradients
  * \tparam T LatticeType
  */
+/**
+ * GPU equivalent of update_lattice_gather_covariant() for the baryon density
+ * lattice. Marshals the contributing particles of all ensembles into a
+ * structure-of-arrays, builds a uniform cell-list (bin edge = r_cut) and the
+ * occupied node bounding box, runs the Metal/CUDA gather (gpu::run_gather), and
+ * writes the 24 currents/node back via DensityOnLattice::set_currents_from_gpu().
+ * The (node, particle) contributions are identical to the CPU gather (the same
+ * two r_cut culls of unnormalized_smearing_factor are applied), so the result
+ * matches up to FP32; validated by conservation as everywhere in this path.
+ * \return true if it ran on the GPU; false to fall back to the CPU.
+ */
+inline bool gather_on_gpu(RectangularLattice<DensityOnLattice> *lat,
+                          const DensityType dens_type,
+                          const DensityParameters &par,
+                          const std::vector<Particles> &ensembles,
+                          const bool compute_gradient) {
+  const std::array<int, 3> n_cells = lat->n_cells();
+  const std::array<double, 3> csize = lat->cell_sizes();
+  const std::array<double, 3> origin = lat->origin();
+  const double r_cut = par.r_cut();
+  const bool do_derivatives =
+      compute_gradient &&
+      par.derivatives() == DerivativesMode::CovariantGaussian;
+
+  std::vector<float> sx, sy, sz, p0, px, py, pz, dfac;
+  size_t ntot = 0;
+  for (const Particles &particles : ensembles) {
+    ntot += particles.size();
+  }
+  sx.reserve(ntot); sy.reserve(ntot); sz.reserve(ntot);
+  p0.reserve(ntot); px.reserve(ntot); py.reserve(ntot); pz.reserve(ntot);
+  dfac.reserve(ntot);
+  for (const Particles &particles : ensembles) {
+    for (const ParticleData &part : particles) {
+      if (par.only_participants() &&
+          part.get_history().collisions_per_particle == 0) {
+        continue;
+      }
+      const double df = density_factor(part.type(), dens_type);
+      if (std::abs(df) < really_small) {
+        continue;
+      }
+      const FourVector pmu = part.momentum();
+      if (pmu.abs() < really_small) {
+        continue;
+      }
+      const ThreeVector pos = part.position().threevec();
+      sx.push_back(static_cast<float>(pos[0]));
+      sy.push_back(static_cast<float>(pos[1]));
+      sz.push_back(static_cast<float>(pos[2]));
+      p0.push_back(static_cast<float>(pmu.x0()));
+      px.push_back(static_cast<float>(pmu.x1()));
+      py.push_back(static_cast<float>(pmu.x2()));
+      pz.push_back(static_cast<float>(pmu.x3()));
+      dfac.push_back(static_cast<float>(df));
+    }
+  }
+  const int n_src = static_cast<int>(sx.size());
+  if (n_src == 0) {
+    return true;  // lattice already reset() to zero -- nothing to gather
+  }
+
+  // Uniform cell-list, bin edge = r_cut (world units): every node sees all its
+  // r_cut neighbours within +-1 bin.
+  std::array<int, 3> nbin;
+  for (int i = 0; i < 3; i++) {
+    nbin[i] = static_cast<int>(std::floor(n_cells[i] * csize[i] / r_cut)) + 1;
+    if (nbin[i] < 1) {
+      nbin[i] = 1;
+    }
+  }
+  auto bin_axis = [&](float v, int a) {
+    int b = static_cast<int>(std::floor((v - origin[a]) / r_cut));
+    return b < 0 ? 0 : (b >= nbin[a] ? nbin[a] - 1 : b);
+  };
+  const int n_bins = nbin[0] * nbin[1] * nbin[2];
+  std::vector<int> bin_of(n_src), bin_start(n_bins + 1, 0), bin_part(n_src);
+  for (int i = 0; i < n_src; i++) {
+    const int b = bin_axis(sx[i], 0) +
+                  nbin[0] * (bin_axis(sy[i], 1) + nbin[1] * bin_axis(sz[i], 2));
+    bin_of[i] = b;
+    bin_start[b + 1]++;
+  }
+  for (int b = 0; b < n_bins; b++) {
+    bin_start[b + 1] += bin_start[b];
+  }
+  std::vector<int> cursor(bin_start.begin(), bin_start.end() - 1);
+  for (int i = 0; i < n_src; i++) {
+    bin_part[cursor[bin_of[i]]++] = i;
+  }
+
+  // Occupied node bounding box [gl, gu): same cube formula as the CPU gather.
+  std::array<int, 3> gl = {n_cells[0], n_cells[1], n_cells[2]};
+  std::array<int, 3> gu = {0, 0, 0};
+  for (int i = 0; i < n_src; i++) {
+    const float pp[3] = {sx[i], sy[i], sz[i]};
+    for (int a = 0; a < 3; a++) {
+      int l = static_cast<int>(
+          std::ceil((pp[a] - origin[a] - r_cut) / csize[a] - 0.5));
+      int u = static_cast<int>(
+          std::ceil((pp[a] - origin[a] + r_cut) / csize[a] - 0.5));
+      if (l < 0) l = 0;
+      if (u > n_cells[a]) u = n_cells[a];
+      if (l < gl[a]) gl[a] = l;
+      if (u > gu[a]) gu[a] = u;
+    }
+  }
+  for (int a = 0; a < 3; a++) {
+    if (gu[a] <= gl[a]) {
+      return true;  // all cubes fell outside the lattice
+    }
+  }
+
+  const long n_nodes =
+      static_cast<long>(n_cells[0]) * n_cells[1] * n_cells[2];
+  std::vector<float> out(static_cast<size_t>(24) * n_nodes, 0.0f);
+  gpu::GatherJob job;
+  job.n_src = n_src;
+  job.sx = sx.data(); job.sy = sy.data(); job.sz = sz.data();
+  job.p0 = p0.data(); job.px = px.data(); job.py = py.data(); job.pz = pz.data();
+  job.dfac = dfac.data();
+  job.nbx = nbin[0]; job.nby = nbin[1]; job.nbz = nbin[2];
+  job.bin_start = bin_start.data(); job.bin_part = bin_part.data();
+  job.nx = n_cells[0]; job.ny = n_cells[1]; job.nz = n_cells[2];
+  job.ox = static_cast<float>(origin[0]);
+  job.oy = static_cast<float>(origin[1]);
+  job.oz = static_cast<float>(origin[2]);
+  job.hx = static_cast<float>(csize[0]);
+  job.hy = static_cast<float>(csize[1]);
+  job.hz = static_cast<float>(csize[2]);
+  job.rcut = static_cast<float>(r_cut);
+  job.two_sig_sqr_inv = static_cast<float>(par.two_sig_sqr_inv());
+  job.norm = static_cast<float>(par.norm_factor_sf());
+  job.compute_gradient = do_derivatives ? 1 : 0;
+  job.glx = gl[0]; job.gly = gl[1]; job.glz = gl[2];
+  job.gux = gu[0]; job.guy = gu[1]; job.guz = gu[2];
+  job.out = out.data();
+  if (!gpu::run_gather(job)) {
+    return false;
+  }
+  for (int iz = gl[2]; iz < gu[2]; iz++) {
+    for (int iy = gl[1]; iy < gu[1]; iy++) {
+      for (int ix = gl[0]; ix < gu[0]; ix++) {
+        const long node_i = ix + static_cast<long>(n_cells[0]) *
+                                     (iy + static_cast<long>(n_cells[1]) * iz);
+        (*lat)[node_i].set_currents_from_gpu(&out[static_cast<size_t>(node_i) *
+                                                  24]);
+      }
+    }
+  }
+  return true;
+}
+
 template <typename T>
 void update_lattice_accumulating_ensembles(
     RectangularLattice<T> *lat, const LatticeUpdate update,
@@ -952,6 +1125,19 @@ void update_lattice_accumulating_ensembles(
   // Do not proceed if lattice does not exists/update not required
   if (lat == nullptr || lat->when_update() != update) {
     return;
+  }
+  // GPU mean-field path: when a Metal/CUDA backend is enabled, the covariant
+  // Gaussian baryon-density fill runs on the device (the dominant ~75% of the
+  // mean-field step). Bypasses the OpenMP thread-gate below. Falls back to the
+  // CPU path if the backend declines.
+  if constexpr (std::is_same_v<T, DensityOnLattice>) {
+    if (gpu::enabled() && !lat->periodic() &&
+        par.smearing() == SmearingMode::CovariantGaussian) {
+      lat->reset();
+      if (gather_on_gpu(lat, dens_type, par, ensembles, compute_gradient)) {
+        return;
+      }
+    }
   }
   // Node-parallel gather for the collider hot path (non-periodic lattice,
   // covariant Gaussian smearing): identical (node, particle) contributions to
