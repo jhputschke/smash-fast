@@ -382,11 +382,63 @@ the (coherent, cheap) boundary. Bounded by Amdahl — the CPU-only physics sets 
 floor — and so most attractive for **mean-field-dominated, large-lattice,
 high-test-particle, batched** runs.
 
+#### 3c prototype (implemented 2026-06-12) — device-resident loop on Metal
+
+[`gpu/smash_mlx_meanfield_step.py`](gpu/smash_mlx_meanfield_step.py) chains the §3a
+gather and §3d force kernels into the hybrid step and runs it resident on the Metal
+GPU for many timesteps: **gather (§3a) → force/root-find (§3d) → propagation**, with
+the gather's four-current lattice fed *straight into the force kernel as device
+arrays — no host round-trip between kernels*. Per step, only (a) the particle
+positions go to the host so the CPU rebuilds the cell-list (the irregular
+bookkeeping that, in real SMASH, overlaps the CPU-side collision finding) and (b) a
+scalar summary returns. Measured (60³ lattice, 25 600 particles, 10 steps, M3 Max):
+**~17 ms/step GPU** (gather+force+propagate) vs **~1.6 ms/step host** (cell-list);
+the loop is stable and physical (the blob expands → peak ρ falls 53.2 → 52.8 fm⁻³,
+Σ\|p\| rises as the mean field accelerates the baryons). This realises the §3c
+data-residency pattern end-to-end on real GPU hardware.
+
+**Still to do for production §3c:** (i) wire these kernels into SMASH's
+`Experiment` loop (the prototype is standalone, like the other `gpu/` files) so the
+real particle/lattice arrays live on the device and the CPU collision-finding step
+interleaves; (ii) keep the cell-list build on-device (a GPU counting sort) to drop
+even the positional round-trip; (iii) carry the symmetry/Coulomb force terms and
+`force_scale` (the prototype does the momentum-dependent Skyrme piece, the dominant
+one). The Amdahl floor is then the CPU collision/string physics, so the win is
+largest for mean-field-dominated, large-lattice, high-test-particle runs.
+
 ### 3d. GPU root-find
 
 Per-particle and parallel across particles: the tabulated `U` (and `∂U/∂p`) lookup
 + a fixed-iteration Newton is warp-friendly and FP32-amenable, removing the GSL
 brent loop entirely on device. Naturally rides along with 3c.
+
+#### 3d prototype (implemented 2026-06-12) — Metal kernel, verified vs FP64
+
+Built the GPU momentum-dependent **force / root-find** — the device version of the
+serial CPU `update_momenta` (§1c) — as a Metal kernel with a CUDA companion:
+[`gpu/smash_mlx_force_prototype.py`](gpu/smash_mlx_force_prototype.py) and
+[`gpu/smash_force_gpu_prototype.cu`](gpu/smash_force_gpu_prototype.cu). One thread
+per particle: a central-difference energy gradient (6 root-finds), each solving
+`root_eq_potentials(E)=0` over the tabulated `U(p_LRF,ρ_LRF)` (built from
+`skyrme_pot`+`momentum_dependent_part`, same params as `potentials_md.yaml`), then
+`force = −∇E`, `p += force·dt`. The GSL brent loop is replaced by a **40-step
+fixed-iteration bisection** — branch-light, deterministic, FP32-amenable, and with
+**no per-thread solver state** (it was exactly that process-global static that made
+the CPU force non-thread-safe, §1c). Verified vs a vectorised NumPy FP64 reference
+using the *same* bisection (so only the precision differs):
+
+| scale | force·dt rel-RMS (FP32 vs FP64) | rel-bias | Metal kernel |
+|---|---|---|---|
+| 48³ lattice / 20 000 particles | 7.0×10⁻⁶ | −3×10⁻⁸ | 0.7 ms |
+| 80³ / 25 600 (SIS scale) | 6.9×10⁻⁶ | −5×10⁻⁹ | **1.7 ms** |
+
+FP32 bisection over the U-table is accurate to ~10⁻⁵ on the momentum kick at SIS
+(consistent with §3b), with no bias. **1.7 ms** for the 25 600-particle force —
+versus the ~4.2 s serial CPU `update_momenta` that the profile flagged as the
+bottleneck. (`∂U/∂p` + Newton, §3d's stated optimisation, would cut the iteration
+count further; bisection already converges to the same root and is robust.) The
+`.cu` is templated on precision (`float`↔`double`) so GB10 can run the branch in
+full FP64 at no throughput loss; it self-verifies vs an OpenMP FP64 reference.
 
 ---
 
@@ -446,7 +498,7 @@ brent loop entirely on device. Naturally rides along with 3c.
 2. **Engineering wins**: ✅ gather *bounding box* + buffer *reserve* done (§1c, bit-identical); *still open* — gather over-inclusion bin tuning, cross-step buffer persistence, tabulation polish. *(low risk; remaining bin-tuning needs a conservation check)*
 3. **Event-level parallelism** harness. *(biggest production lever, independent of the above; also sidesteps the ~18 s single-threaded startup by amortizing it)*
 4. ~~**FP32 precision-drift study on CPU**~~ — **done (§3b)**: passed at SIS (charge exact, conservation unchanged, drift below the multi-thread noise, no bias); deviation grows with γ so re-check before relativistic production. *(gate cleared for SIS/mean-field-dominated GPU FP32)*
-5. **FP32 hybrid GPU mean-field step** (§3a/3c/3d) — ✅ *§3a density-gather kernel done & verified on Metal* ([`gpu/smash_mlx_meanfield_prototype.py`](gpu/smash_mlx_meanfield_prototype.py) + CUDA companion), mixed-precision (Kahan-FP32 / FP64) within 10⁻⁷ of FP64. *Still open:* GPU force kernel + root-find (§3d), device-resident hybrid loop (§3c), and wiring into SMASH (the prototype is standalone). *(research-grade; gather layer landed)*
+5. **FP32 hybrid GPU mean-field step** (§3a/3c/3d) — ✅ *all three kernels prototyped & verified on Metal* (+ CUDA companions): §3a density gather (within 10⁻⁷ of FP64), §3d force/root-find (within 7×10⁻⁶), §3c device-resident gather→force→propagate loop (~17 ms/step, stable). *Still open:* wire the kernels into SMASH's `Experiment` loop (prototypes are standalone), on-device cell-list, and the symmetry/Coulomb force terms. *(research-grade; full mean-field step demonstrated, integration remains)*
 6. Opportunistic: Pauli grid pre-cull **only for collision-dominated configs** (subleading here, §1b/§4), deterministic reductions, incremental/adaptive lattice, disk-cached spectral tabulation. *(research-grade)*
 
 The throughline: the tabulation and gather already turned the mean-field path from

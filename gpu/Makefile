@@ -8,7 +8,8 @@ NVCC ?= nvcc
 NVCCFLAGS ?= -O3 -arch=native -Xcompiler -fopenmp
 PYTHON ?= /opt/homebrew/Caskroom/miniconda/base/envs/fno_env_mlx/bin/python
 
-all: smash_gpu_prototype smash_meanfield_gpu_prototype unified_memory_bench
+all: smash_gpu_prototype smash_meanfield_gpu_prototype \
+     smash_force_gpu_prototype unified_memory_bench
 
 smash_gpu_prototype: smash_gpu_prototype.cu
 	$(NVCC) $(NVCCFLAGS) $< -o $@
@@ -18,15 +19,22 @@ smash_gpu_prototype: smash_gpu_prototype.cu
 smash_meanfield_gpu_prototype: smash_meanfield_gpu_prototype.cu
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
+# Momentum-dependent force / root-find (3d): per-particle bisection over the
+# tabulated U. CUDA companion of smash_mlx_force_prototype.py (Metal).
+smash_force_gpu_prototype: smash_force_gpu_prototype.cu
+	$(NVCC) $(NVCCFLAGS) $< -o $@
+
 # GB10 unified-/coherent-memory benchmark (explicit vs managed vs ATS vs resident).
 unified_memory_bench: unified_memory_bench.cu
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
 .PHONY: all run run-mlx clean
-run: smash_gpu_prototype smash_meanfield_gpu_prototype unified_memory_bench
+run: smash_gpu_prototype smash_meanfield_gpu_prototype smash_force_gpu_prototype unified_memory_bench
 	OMP_NUM_THREADS=$(shell nproc) ./smash_gpu_prototype 64 24
 	@echo
 	OMP_NUM_THREADS=$(shell nproc) ./smash_meanfield_gpu_prototype 80 25600
+	@echo
+	OMP_NUM_THREADS=$(shell nproc) ./smash_force_gpu_prototype 48 20000
 	@echo
 	OMP_NUM_THREADS=$(shell nproc) ./unified_memory_bench 64 24
 
@@ -34,6 +42,8 @@ run: smash_gpu_prototype smash_meanfield_gpu_prototype unified_memory_bench
 # smash_mlx_prototype.py            : vectorized MLX array ops (idiomatic)
 # smash_mlx_metal_prototype.py      : explicit Metal kernels (kernel-for-kernel CUDA port)
 # smash_mlx_meanfield_prototype.py  : mean-field density gather (3a), Metal, fp32 + Kahan
+# smash_mlx_force_prototype.py      : momentum-dependent force / root-find (3d), Metal
+# smash_mlx_meanfield_step.py       : device-resident gather->force->propagate loop (3c)
 # unified_memory_bench_mlx.py       : unified-memory benchmark
 run-mlx:
 	$(PYTHON) smash_mlx_prototype.py 64 24
@@ -42,7 +52,12 @@ run-mlx:
 	@echo
 	$(PYTHON) smash_mlx_meanfield_prototype.py 80 25600
 	@echo
+	$(PYTHON) smash_mlx_force_prototype.py 48 20000
+	@echo
+	$(PYTHON) smash_mlx_meanfield_step.py 60 25600 10
+	@echo
 	$(PYTHON) unified_memory_bench_mlx.py 64 24
 
 clean:
-	rm -f smash_gpu_prototype smash_meanfield_gpu_prototype unified_memory_bench
+	rm -f smash_gpu_prototype smash_meanfield_gpu_prototype \
+	      smash_force_gpu_prototype unified_memory_bench

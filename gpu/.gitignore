@@ -1,4 +1,5 @@
 smash_gpu_prototype
 smash_meanfield_gpu_prototype
+smash_force_gpu_prototype
 unified_memory_bench
 __pycache__/
