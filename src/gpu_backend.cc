@@ -22,6 +22,7 @@ namespace detail {
 bool backend_available();
 const char *backend_name();
 bool backend_gather(const GatherJob &job);
+bool backend_force(const ForceJob &job);
 }  // namespace detail
 
 namespace {
@@ -88,6 +89,8 @@ bool enabled() {
 }
 
 bool run_gather(const GatherJob &job) { return detail::backend_gather(job); }
+
+bool run_force(const ForceJob &job) { return detail::backend_force(job); }
 
 }  // namespace gpu
 }  // namespace smash

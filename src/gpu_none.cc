@@ -19,6 +19,7 @@ namespace detail {
 bool backend_available() { return false; }
 const char *backend_name() { return "none"; }
 bool backend_gather(const GatherJob &) { return false; }
+bool backend_force(const ForceJob &) { return false; }
 
 }  // namespace detail
 }  // namespace gpu

@@ -83,6 +83,46 @@ struct GatherJob {
  */
 bool run_gather(const GatherJob &job);
 
+/**
+ * Plain-data description of one momentum-dependent force / momentum-update call
+ * (the device version of update_momenta() for the lattice-based,
+ * momentum-dependent Skyrme + symmetry potential). Per particle the kernel forms
+ * the calculation-frame energy gradient by a central finite difference, each
+ * point solving root_eq_potentials(E)=0 over the tabulated U(p_LRF,rho_LRF) with
+ * a fixed-iteration bisection (the device replacement for the GSL root-find), and
+ * applies force = -scale1*grad(E) + scale2*iso3*(FI3.first + v x FI3.second).
+ *
+ * `active[i]==0` (non-baryon) or a position outside the lattice leaves the
+ * momentum unchanged. Output is the new three-momentum per particle.
+ */
+struct ForceJob {
+  int n_part;
+  const float *rx, *ry, *rz;       ///< positions [fm]
+  const float *px, *py, *pz;       ///< three-momentum [GeV]
+  const float *p0;                 ///< energy [GeV] (for the velocity)
+  const float *meff;               ///< effective mass [GeV]
+  const float *scale1, *scale2;    ///< Potentials::force_scale().first/.second
+  const float *iso3;               ///< isospin3_rel per particle
+  const int *active;               ///< 1 for baryons/nuclei, else 0
+  const float *jB;                 ///< net baryon current, 4*n_nodes (nearest)
+  const float *fi3;                ///< symmetry field, 6*n_nodes (first,second)
+  int nx, ny, nz;                  ///< lattice cells per axis
+  float ox, oy, oz;                ///< lattice origin [fm]
+  float hx, hy, hz;                ///< cell sizes [fm]
+  const float *U;                  ///< U(p,rho) table, n_p*n_rho
+  int n_p, n_rho;                  ///< table dimensions
+  float inv_dp, inv_drho, p_max, rho_max;  ///< table grid
+  int niter;                       ///< bisection iterations
+  float dt;                        ///< time step [fm]
+  float *npx, *npy, *npz;          ///< output new three-momentum [GeV]
+};
+
+/**
+ * Run the momentum-dependent force / momentum update on the GPU.
+ * \return true on success; false if the caller must use the CPU path.
+ */
+bool run_force(const ForceJob &job);
+
 }  // namespace gpu
 }  // namespace smash
 

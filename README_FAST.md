@@ -31,7 +31,7 @@ detail and transparency.
 | **Strings** (Pythia, Collider) | **still the ensemble loop** (per‑thread Pythia/`StringProcess`, static schedule) — *not* a separate parallel path | **~2× (8t)** — but only with `Ensembles > 1` **and** strings that actually fire (high √s); otherwise **slower** (see below) | bit‑identical (moderate strings) / conserved to 1.7e‑10 (heavy strings) |
 | **Single big event** (`Ensembles: 1`) | cell‑parallel pair search in action finding | **3.9× (8t)** | bit‑identical across thread counts |
 | **Mean‑field / potentials** (CPU) | tabulated momentum‑dependent root‑find + node‑parallel *gather* density fill + node‑parallel force loops | **~2.4× (8t)** over the original momentum‑dependent baseline | validated by conservation (FP‑chaotic; see below) |
-| **GPU mean‑field density fill** (Metal/CUDA, *integrated*) | covariant‑Gaussian baryon‑density lattice fill on the device — the ~75% hot path of a **potentials run** | **2.8× (1t), 2.2× (8t)** vs the CPU at the same thread count — **potentials Collider runs only** (see below) | charge & Npart exact, energy to ~1e‑9 vs CPU |
+| **GPU mean‑field step** (Metal/CUDA, *integrated*) | the **density fill** *and* the **momentum‑dependent force / root‑find** on the device — the two dominant computes of a **potentials run** | **5.0× (1t), 2.4× (8t)** vs the CPU at the same thread count — **potentials Collider runs only** (see below) | charge & Npart exact, energy to ~5e‑8 vs CPU |
 
 > The GPU row helps **only for mean‑field / potentials runs** (a covariant‑Gaussian
 > density lattice on a non‑periodic Collider lattice). It does **nothing** for runs
@@ -112,10 +112,12 @@ Everything else (config files, `-i/-p/-d`, output, etc.) works exactly as in the
 
 ---
 
-## GPU acceleration (mean‑field density fill)
+## GPU acceleration (mean‑field step)
 
-When a GPU is present, the covariant‑Gaussian **baryon‑density lattice fill** —
-the dominant compute of a mean‑field (potentials) run — can run on the device.
+When a GPU is present, the two dominant computes of a mean‑field (potentials)
+run — the covariant‑Gaussian **baryon‑density lattice fill** and the
+**momentum‑dependent force / root‑find** (the device `update_momenta`) — can run
+on the device.
 The backend is pure C++/Metal/CUDA (no Python/MLX) and is selected automatically
 by CMake at configure time: **Metal** on Apple Silicon, **CUDA** where an `nvcc`
 toolkit is found, otherwise a CPU stub. Look for the configure line
@@ -140,28 +142,33 @@ auto)`.
 
 ### When the GPU actually helps
 
-The GPU path replaces **one** kernel: the covariant‑Gaussian baryon‑density
-lattice fill. It therefore helps **only when that fill is a large share of the
-runtime**, i.e. a **potentials / mean‑field Collider run**. Concretely it engages
-when **all** of these hold (otherwise it silently stays on the CPU):
+The GPU path offloads the mean‑field **density fill** and **force**. It therefore
+helps **only when those dominate the runtime**, i.e. a **potentials / mean‑field
+Collider run**. Concretely the **density fill** runs on the GPU when **all** of
+these hold (otherwise it silently stays on the CPU):
 
 - `Potentials:` are configured (so a density lattice is built every step), **and**
 - smearing is **Covariant Gaussian** (`Smearing_Mode: Covariant Gaussian`, the
   default for potentials), **and**
 - the lattice is **non‑periodic** — i.e. the **Collider** modus, *not* a box.
 
+The **force** additionally runs on the GPU only with **momentum‑dependent**
+Skyrme potentials (`Momentum_Dependence:`) and no VDF / Coulomb / out‑of‑lattice
+potentials; otherwise the (OpenMP‑parallel) CPU force is used while the density
+fill still runs on the GPU.
+
 It gives **no benefit** for runs without potentials, for the **box** modus
 (periodic lattice → the gather, and hence the GPU path, is never used), or for
 **string‑dominated** runs (Pythia on the CPU sets the floor). The collision
 finding, strings, decays and RNG always stay on the CPU.
 
-The benefit is **largest at low thread counts**, because the CPU alternative (the
-node‑parallel gather) already scales with OpenMP: on an M3 Max with the SIS
-`verify/potentials_md.yaml` benchmark the mean‑field evolution is **2.8× faster at
-1 thread** and still **2.2× faster at 8 threads** (10.3 s → 4.7 s) with the GPU on
-— so the GPU is most attractive when you have **few CPU threads, a large lattice,
-and many test‑particles**. Charge and particle number are unchanged and total
-energy agrees to ~1e‑9 vs the CPU path.
+The benefit is **largest at low thread counts**, because the CPU alternatives
+already scale with OpenMP: on an M3 Max with the SIS `verify/potentials_md.yaml`
+benchmark the mean‑field evolution is **5.0× faster at 1 thread** (27.4 s → 5.5 s)
+and still **2.4× faster at 8 threads** (10.3 s → 4.3 s) with the GPU on — so the
+GPU is most attractive when you have **few CPU threads, a large lattice, and many
+test‑particles**. Charge and particle number are unchanged and total energy agrees
+to ~5e‑8 vs the CPU path.
 
 Standalone GPU kernels (gather, force/root‑find, a resident multi‑step loop) and
 their CUDA companions live in [`gpu/`](gpu/); design notes are in
@@ -183,7 +190,7 @@ Pythia 8.316; "evolution time" excludes the one‑time serial cache warm‑up):
 | **`Strings: True`, `Ensembles: 1`** *or* **low‑energy Collider** (strings never fire) | nothing parallelizes — one ensemble = no work to split, yet `OMP_NUM_THREADS` Pythia instances are still built; the strings flag also **disables** the cell‑parallel finder | **< 1× (slower than 1 thread)** | the common trap, e.g. Au+Au at `E_Kin: 1.23` GeV. Fix: set `Strings: False` (physically identical at that energy) and/or raise `Ensembles` — see callout below |
 | **`Ensembles: 1`, `Strings: False`, non‑stochastic criterion** | cell‑parallel pair search | 1.65× (2t), 2.66× (4t), 3.9× (8t) | `verify/box_heavy.yaml` with 1 ensemble |
 | **`Potentials:` (mean field)** | tabulated root‑find (deterministic) + **gather density fill for ≥ 4 threads** + node‑parallel force loops | 1.13× (1t, tabulation only), 1.54× (4t), **2.43× (8t)** | `input/potentials`, `verify/potentials_nomd.yaml`, `verify/potentials_md.yaml` |
-| **`Potentials:` + GPU detected** (Collider, Covariant Gaussian, `Gpu: auto`) | density lattice fill offloaded to **Metal/CUDA**; root‑find + force loops stay on CPU | **2.8× (1t), 2.2× (8t)** over the CPU mean‑field path at the same thread count *(M3 Max)* | engages **only** for non‑periodic (Collider) potentials runs with Covariant Gaussian smearing — box modus and non‑potentials runs are unaffected. `verify/potentials_md.yaml` |
+| **`Potentials:` + GPU detected** (Collider, Covariant Gaussian, `Gpu: auto`) | density lattice fill **and** (with `Momentum_Dependence:`) the force / root‑find offloaded to **Metal/CUDA** | **5.0× (1t), 2.4× (8t)** over the CPU mean‑field path at the same thread count *(M3 Max)* | engages **only** for non‑periodic (Collider) potentials runs with Covariant Gaussian smearing — box modus and non‑potentials runs are unaffected. `verify/potentials_md.yaml` |
 
 Key mean‑field detail: the density smearing switches from the serial **scatter**
 to the node‑parallel **gather** only when **≥ 4 threads** are available (the

@@ -408,33 +408,47 @@ largest for mean-field-dominated, large-lattice, high-test-particle runs.
 
 #### In-engine integration (implemented 2026-06-12) — Metal/CUDA, no Python/MLX
 
-The §3a density gather is now **wired into SMASH proper** (not a standalone
-prototype): a pure C++/Metal/CUDA backend that the build selects automatically.
+The §3a density gather **and** the §3d momentum-dependent force are now **wired
+into SMASH proper** (not standalone prototypes): a pure C++/Metal/CUDA backend
+that the build selects automatically.
 
 - **Backend** [`src/include/smash/gpu_backend.h`](src/include/smash/gpu_backend.h)
   + [`src/gpu_backend.cc`](src/gpu_backend.cc) (dispatch) with three device
   implementations — [`src/gpu_metal.mm`](src/gpu_metal.mm) (Objective-C++ host +
-  embedded MSL kernel), [`src/gpu_cuda.cu`](src/gpu_cuda.cu) (line-for-line CUDA
-  port), [`src/gpu_none.cc`](src/gpu_none.cc) (CPU stub). The kernel reproduces the
-  full `DensityOnLattice` node state — `jmu_pos`, `jmu_neg` and the 16 Gaussian
-  current derivatives `djmu_dxnu` (24 floats/node) — so forces are unaffected.
+  embedded MSL kernels), [`src/gpu_cuda.cu`](src/gpu_cuda.cu) (line-for-line CUDA
+  port), [`src/gpu_none.cc`](src/gpu_none.cc) (CPU stub). Two kernels:
+  - **gather** — reproduces the full `DensityOnLattice` node state (`jmu_pos`,
+    `jmu_neg` and the 16 Gaussian current derivatives `djmu_dxnu`, 24 floats/node),
+    hooked in `update_lattice_accumulating_ensembles` (density.h);
+  - **force** — the device `update_momenta`: per particle a central-difference
+    energy gradient with a 40-step bisection root-find over the tabulated
+    `U(p,ρ)` + the symmetry (`FI3`) term, hooked in
+    [`update_momenta`](src/propagation.cc) (a `Potentials` accessor exposes the
+    `U`-table). Engages for the momentum-dependent, lattice-based case (Skyrme +
+    momentum dependence + optional symmetry, no VDF / Coulomb / outside-lattice);
+    falls back to the CPU loop otherwise.
 - **CMake** auto-detects the backend: Metal on Apple, CUDA via `CheckLanguage`/
   `CUDAToolkit` on NVIDIA, else the stub (`option(SMASH_USE_GPU)` to force off).
   Frameworks/libs flow through `SMASH_LIBRARIES` to every target.
 - **Control:** env `SMASH_GPU=auto|on|off` (overrides) and config
   `General: { Gpu: auto|on|off }` (`InputKeys::gen_gpu`); **default auto → GPU when
-  a device is detected.** Hooked in `update_lattice_accumulating_ensembles`
-  (density.h), bypassing the OpenMP thread-gate; falls back to CPU if the backend
-  declines.
+  a device is detected.** Both hooks bypass the OpenMP thread-gate and fall back to
+  CPU if the backend declines (so unsupported configs Just Work).
 - **Verified on M3 Max** (`verify/potentials_md.yaml`): GPU-on vs GPU-off gives
-  **charge exact, Npart exact, energy rel-diff ~10⁻⁹** — the FP32 gather is
-  physically equivalent to the CPU path at SIS. Speedups: **2.8× at T=1** (vs CPU
-  scatter), **2.18× at T=8** (vs the already-parallel CPU gather; 10.3 → 4.7 s
-  evolution), ~6× cumulative vs the pre-speedup baseline.
-- **Remaining:** integrate the §3d force/root-find into `update_momenta` on the
-  same backend (kernel verified standalone), keep particle/lattice device-resident
-  across steps (currently re-uploaded per fill), and an on-device cell-list. The
-  CUDA backend is written but built/run only where `nvcc` is present.
+  **charge exact, Npart exact, energy rel-diff ~5×10⁻⁸** — the FP32 gather+force
+  is physically equivalent to the CPU path at SIS. Mean-field evolution speedups
+  with **both** kernels on: **5.0× at T=1** (27.4 → 5.5 s) and **2.4× at T=8**
+  (10.3 → 4.3 s, on top of the already-parallel CPU gather) — ~7× cumulative vs
+  the pre-speedup baseline. The force fallback was confirmed on the non-momentum-
+  dependent config (force → CPU, gather → GPU, conserves).
+- **Remaining (optimisation / coverage, not core function):** keep the
+  particle/lattice arrays **device-resident across steps** (the gather and force
+  currently each re-upload particles + the lattice and copy the result back —
+  cheap on unified memory but real CPU marshalling); an **on-device cell-list**
+  (GPU counting sort) to drop the positional round-trip; move the **force-field
+  lattices** (`FB`/`FI3`/`drho_dxnu`, computed from the density) onto the GPU too;
+  **VDF / Coulomb** force coverage; a Kahan accumulator and persistent device
+  buffers. The CUDA backend is written but built/run only where `nvcc` is present.
 
 ### 3d. GPU root-find
 
@@ -528,7 +542,7 @@ full FP64 at no throughput loss; it self-verifies vs an OpenMP FP64 reference.
 2. **Engineering wins**: ✅ gather *bounding box* + buffer *reserve* done (§1c, bit-identical); *still open* — gather over-inclusion bin tuning, cross-step buffer persistence, tabulation polish. *(low risk; remaining bin-tuning needs a conservation check)*
 3. **Event-level parallelism** harness. *(biggest production lever, independent of the above; also sidesteps the ~18 s single-threaded startup by amortizing it)*
 4. ~~**FP32 precision-drift study on CPU**~~ — **done (§3b)**: passed at SIS (charge exact, conservation unchanged, drift below the multi-thread noise, no bias); deviation grows with γ so re-check before relativistic production. *(gate cleared for SIS/mean-field-dominated GPU FP32)*
-5. **FP32 hybrid GPU mean-field step** (§3a/3c/3d) — ✅ *kernels prototyped & verified on Metal* (+ CUDA companions); ✅ **§3a density gather now integrated into SMASH** as a pure C++/Metal/CUDA backend (CMake auto-detect; `SMASH_GPU` env + `General: Gpu` config; default GPU-on when detected) — GPU-on vs GPU-off charge/Npart exact, energy ~10⁻⁹, **2.8× (T=1) / 2.18× (T=8)**. *Still open:* integrate the §3d force into `update_momenta`, device-residency across steps, on-device cell-list. *(research-grade; gather in-engine, force integration next)*
+5. **FP32 hybrid GPU mean-field step** (§3a/3c/3d) — ✅ **integrated into SMASH** as a pure C++/Metal/CUDA backend (CMake auto-detect; `SMASH_GPU` env + `General: Gpu` config; default GPU-on when detected): **both** the §3a density gather **and** the §3d momentum-dependent force/root-find run on the device. GPU-on vs GPU-off charge/Npart exact, energy ~5×10⁻⁸; **5.0× (T=1) / 2.4× (T=8)** on the SIS benchmark. *Still open (optimisation/coverage):* device-residency across steps, on-device cell-list, the force-field lattices on GPU, VDF/Coulomb, and CUDA hardware verification. *(research-grade; the two dominant mean-field computes are in-engine)*
 6. Opportunistic: Pauli grid pre-cull **only for collision-dominated configs** (subleading here, §1b/§4), deterministic reductions, incremental/adaptive lattice, disk-cached spectral tabulation. *(research-grade)*
 
 The throughline: the tabulation and gather already turned the mean-field path from
