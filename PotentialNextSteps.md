@@ -248,6 +248,51 @@ Kahan). Naive FP32 summation of the ~hundreds of particles per node drifts like
 `√N·ε ≈ 2e-6` and can *bias* the density; an FP64 accumulator costs almost nothing
 on the add side and removes that.
 
+#### 3a prototype (implemented 2026-06-12) — Metal kernel, verified vs FP64
+
+Built the GPU density gather as a real GPU kernel and verified it on the M3 Max
+Metal GPU: [`gpu/smash_mlx_meanfield_prototype.py`](gpu/smash_mlx_meanfield_prototype.py)
+(Metal via `mx.fast.metal_kernel`) with a line-for-line CUDA companion for transfer,
+[`gpu/smash_meanfield_gpu_prototype.cu`](gpu/smash_meanfield_gpu_prototype.cu) (both
+wired into [`gpu/Makefile`](gpu/Makefile): `make run-mlx`, `make run`). One thread
+per node, cell-list (bin edge = `r_cut`), `±1`-bin scan, no atomics — the same
+shape as the CPU `update_lattice_gather_covariant()`. Per-pair smearing
+(`exp`, boost, `r_rest²`) in FP32; the FP64-reference (a NumPy/OpenMP `double`
+scatter) is the ground truth.
+
+The **accumulator** is the whole point. Apple's GPU has **no FP64**, so the Metal
+kernel uses a **Kahan-compensated FP32** accumulator as the stand-in for the doc's
+FP64 accumulator; the CUDA companion uses a real `double` (GB10 has FP64). Measured
+relative density error vs FP64 on occupied nodes:
+
+| scenario (max ρ) | naive-FP32 accum | **Kahan-FP32 accum** |
+|---|---|---|
+| SIS-scale 80³ / 25 600 (53 fm⁻³) | rel-RMS 1.2×10⁻⁶ | **9.8×10⁻⁸** |
+| dense 48³ / 150 000 (296 fm⁻³) | rel-RMS 6.6×10⁻⁶, bias 7.7×10⁻⁷ | **8.8×10⁻⁸**, bias 3×10⁻⁸ |
+
+- **The doc's `√N·ε` warning is confirmed:** naive-FP32 accumulation drift *grows
+  with particles-per-node* (1.2×10⁻⁶ → 6.6×10⁻⁶ as ρ goes 53 → 296 fm⁻³) and
+  develops a bias. **Kahan/FP64 accumulation stays flat at ~10⁻⁷** regardless of
+  density, and is essentially free (Metal: 12.1 vs 12.3 ms for the full 80³ fill;
+  the Kahan adds ~2%). → use the mixed-precision accumulator, exactly as 3a says.
+- Even *naive* FP32 is within the ~10⁻⁴ accepted regime at SIS density, consistent
+  with the CPU FP32 study (§3b) — but the compensated accumulator removes the
+  density-dependent bias for free, so there is no reason not to use it.
+- Metal gather throughput: **~12 ms for the 80³ × 25 600 fill** on the M3 Max GPU
+  (the NumPy FP64 scatter "reference" at 1.4 s is a correctness oracle, not a CPU
+  performance baseline — the real CPU comparator is SMASH's C++ gather, which needs
+  the in-engine integration of §3c). The `.cu` reports a proper OpenMP-FP64-vs-GPU
+  speedup when run on a CUDA box.
+
+**Transfer to CUDA:** the per-pair FP32 math in the `.cu` is byte-identical to the
+Metal source; only the accumulator differs (`double` vs Kahan-FP32) and the
+launch boilerplate (`blockIdx/threadIdx` vs `thread_position_in_grid`). Build with
+`nvcc` once a CUDA box is available; the `.cu` self-verifies GPU vs an OpenMP FP64
+reference. **Still to port for the full §3c step:** the force-evaluation kernel +
+GPU root-find (§3d, the tabulated `U` + fixed-iteration Newton — per-particle,
+FP32-amenable, now unblocked by the thread-safe force of §1c) and keeping the
+lattice/particles device-resident across timesteps so only summaries cross the bus.
+
 ### 3b. Precision-drift study (do this on CPU, before any GPU code)
 
 The precision question is separable from the performance question and can be
@@ -401,7 +446,7 @@ brent loop entirely on device. Naturally rides along with 3c.
 2. **Engineering wins**: ✅ gather *bounding box* + buffer *reserve* done (§1c, bit-identical); *still open* — gather over-inclusion bin tuning, cross-step buffer persistence, tabulation polish. *(low risk; remaining bin-tuning needs a conservation check)*
 3. **Event-level parallelism** harness. *(biggest production lever, independent of the above; also sidesteps the ~18 s single-threaded startup by amortizing it)*
 4. ~~**FP32 precision-drift study on CPU**~~ — **done (§3b)**: passed at SIS (charge exact, conservation unchanged, drift below the multi-thread noise, no bias); deviation grows with γ so re-check before relativistic production. *(gate cleared for SIS/mean-field-dominated GPU FP32)*
-5. **§4 passed → FP32 hybrid GPU mean-field step** (§3a/3c/3d) for mean-field-dominated production — has the §1 thread-safe force; the emulated-FP32 gather (`SMASH_FP32_SMEAR`) is the CPU dry-run of the §3a kernel. *(research-grade; now unblocked)*
+5. **FP32 hybrid GPU mean-field step** (§3a/3c/3d) — ✅ *§3a density-gather kernel done & verified on Metal* ([`gpu/smash_mlx_meanfield_prototype.py`](gpu/smash_mlx_meanfield_prototype.py) + CUDA companion), mixed-precision (Kahan-FP32 / FP64) within 10⁻⁷ of FP64. *Still open:* GPU force kernel + root-find (§3d), device-resident hybrid loop (§3c), and wiring into SMASH (the prototype is standalone). *(research-grade; gather layer landed)*
 6. Opportunistic: Pauli grid pre-cull **only for collision-dominated configs** (subleading here, §1b/§4), deterministic reductions, incremental/adaptive lattice, disk-cached spectral tabulation. *(research-grade)*
 
 The throughline: the tabulation and gather already turned the mean-field path from
