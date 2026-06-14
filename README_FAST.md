@@ -31,14 +31,14 @@ detail and transparency.
 | **Strings** (Pythia, Collider) | **still the ensemble loop** (per‑thread Pythia/`StringProcess`, static schedule) — *not* a separate parallel path | **~2× (8t)** — but only with `Ensembles > 1` **and** strings that actually fire (high √s); otherwise **slower** (see below) | bit‑identical (moderate strings) / conserved to 1.7e‑10 (heavy strings) |
 | **Single big event** (`Ensembles: 1`) | cell‑parallel pair search in action finding | **3.9× (8t)** | bit‑identical across thread counts |
 | **Mean‑field / potentials** (CPU) | tabulated momentum‑dependent root‑find + node‑parallel *gather* density fill + node‑parallel force loops | **~2.4× (8t)** over the original momentum‑dependent baseline | validated by conservation (FP‑chaotic; see below) |
-| **GPU mean‑field step** (Metal/CUDA, *integrated*) | the **density fill** *and* the **momentum‑dependent force / root‑find** on the device — the two dominant computes of a **potentials run** | **5.0× (1t), 2.4× (8t)** vs the CPU at the same thread count — **potentials Collider runs only** (see below) | charge & Npart exact, energy to ~5e‑8 vs CPU |
+| **GPU mean‑field step** (Metal/CUDA, *integrated*) | the **density fill** (Collider **and** Box) *and* the **force** — momentum‑dependent root‑find or the Skyrme/VDF field lookup — on the device | **5.0× (1t), 2.4× (8t)** for a collider momentum‑dependent run; **~2× mean‑field** for a box VDF run (gather‑bound) — vs the CPU at the same thread count (see below) | charge & Npart exact, energy to ~5e‑8 vs CPU |
 
 > The GPU row helps **only for mean‑field / potentials runs** (a covariant‑Gaussian
-> density lattice on a non‑periodic Collider lattice). It does **nothing** for runs
-> without potentials, for the box modus (periodic lattice), or for string‑dominated
-> runs — there the CPU paths above are what matter. Standalone GPU kernels for the
-> other GPU‑viable pieces (Phase‑4 box+stochastic finding, **1.4–2× on GB10**;
-> force/root‑find; a resident multi‑step loop) live in [`gpu/`](gpu/).
+> density lattice — now on **both** the Collider (open) and Box (periodic) modus).
+> It does **nothing** for runs without potentials or for string‑dominated runs —
+> there the CPU paths above are what matter. Standalone GPU kernels for the other
+> GPU‑viable pieces (Phase‑4 box+stochastic finding, **1.4–2× on GB10**; a resident
+> multi‑step loop) live in [`gpu/`](gpu/).
 
 The serial build (`USE_OPENMP=OFF`) is byte‑for‑byte the original SMASH — every
 `#pragma omp` is a no‑op without OpenMP.
@@ -114,10 +114,11 @@ Everything else (config files, `-i/-p/-d`, output, etc.) works exactly as in the
 
 ## GPU acceleration (mean‑field step)
 
-When a GPU is present, the two dominant computes of a mean‑field (potentials)
-run — the covariant‑Gaussian **baryon‑density lattice fill** and the
-**momentum‑dependent force / root‑find** (the device `update_momenta`) — can run
-on the device.
+When a GPU is present, the dominant computes of a mean‑field (potentials)
+run — the covariant‑Gaussian **baryon‑density lattice fill** (on the open
+**Collider** *and* the periodic **Box** lattice) and the **force** (the device
+`update_momenta`: the momentum‑dependent root‑find, or the Skyrme/VDF field
+lookup) — can run on the device.
 The backend is pure C++/Metal/CUDA (no Python/MLX) and is selected automatically
 by CMake at configure time: **Metal** on Apple Silicon, **CUDA** where an `nvcc`
 toolkit is found, otherwise a CPU stub. Look for the configure line
@@ -144,38 +145,67 @@ auto)`.
 
 The GPU path offloads the mean‑field **density fill** and **force**. It therefore
 helps **only when those dominate the runtime**, i.e. a **potentials / mean‑field
-Collider run**. Concretely the **density fill** runs on the GPU when **all** of
-these hold (otherwise it silently stays on the CPU):
+run**. Concretely the **density fill** runs on the GPU when **both** of these hold
+(otherwise it silently stays on the CPU):
 
 - `Potentials:` are configured (so a density lattice is built every step), **and**
 - smearing is **Covariant Gaussian** (`Smearing_Mode: Covariant Gaussian`, the
-  default for potentials), **and**
-- the lattice is **non‑periodic** — i.e. the **Collider** modus, *not* a box.
+  default for potentials).
 
-The **force** additionally runs on the GPU only with **momentum‑dependent**
-Skyrme potentials (`Momentum_Dependence:`) and no VDF / Coulomb / out‑of‑lattice
-potentials; otherwise the (OpenMP‑parallel) CPU force is used while the density
-fill still runs on the GPU.
+Both the **Collider** (open lattice) and the **Box** (periodic lattice) modus are
+supported: the periodic gather wraps the cell‑list modulo the cell count and uses
+the minimum‑image displacement, so a box run gets the same device gather as a
+collider. (It falls back to the CPU only if the cutoff is so large the box has
+fewer than three cell‑list bins per axis.)
 
-> **The force offload helps mainly at low thread counts.** The CPU force loop is
-> already OpenMP‑parallel, so the GPU force is a big win at 1 thread (≈1.8× of the
-> mean‑field evolution) but only marginal at 8–16 threads (≈1.05–1.1×), where the
-> CPU force is already small. It is never slower in our measurements, but if you
-> run many CPU threads you can keep the gather on the GPU and the force on the CPU
-> with `SMASH_GPU_FORCE=off` (the gather is where most of the GPU win comes from).
+The **force** also runs on the GPU, in two variants: the **momentum‑dependent**
+Skyrme root‑find (`Momentum_Dependence:`), and a **field‑lookup** force for
+(non‑momentum) Skyrme / **VDF**. Coulomb and out‑of‑lattice fallbacks stay on the
+CPU.
 
-It gives **no benefit** for runs without potentials, for the **box** modus
-(periodic lattice → the gather, and hence the GPU path, is never used), or for
-**string‑dominated** runs (Pythia on the CPU sets the floor). The collision
-finding, strings, decays and RNG always stay on the CPU.
+> **Keep the *cheap* force on the CPU.** The CPU force loop is already
+> OpenMP‑parallel. The momentum‑dependent root‑find is heavy, so offloading it
+> wins at low thread counts. But the **VDF / non‑momentum field force is just a
+> per‑particle lattice lookup** — marshalling every particle to the device each
+> step costs more than it saves. Set `SMASH_GPU_FORCE=off` to keep the **gather on
+> the GPU and the force on the CPU**; for VDF this is the fastest setting at every
+> thread count (see the box table below) and is where essentially all of the GPU
+> win comes from.
+
+It gives **no benefit** for runs without potentials or for **string‑dominated**
+runs (Pythia on the CPU sets the floor). The collision finding, strings, decays
+and RNG always stay on the CPU.
 
 The benefit is **largest at low thread counts**, because the CPU alternatives
-already scale with OpenMP: on an M3 Max with the SIS `verify/potentials_md.yaml`
-benchmark the mean‑field evolution is **5.0× faster at 1 thread** (27.4 s → 5.5 s)
-and still **2.4× faster at 8 threads** (10.3 s → 4.3 s) with the GPU on — so the
-GPU is most attractive when you have **few CPU threads, a large lattice, and many
-test‑particles**. Charge and particle number are unchanged and total energy agrees
-to ~5e‑8 vs the CPU path.
+already scale with OpenMP. Two measured cases on an M3 Max (Metal, best‑of‑3
+`Time real`):
+
+**Collider, momentum‑dependent Skyrme** (`verify/potentials_md.yaml`, 80³ lattice):
+the mean‑field evolution is **5.0× faster at 1 thread** (27.4 s → 5.5 s) and
+**2.4× at 8 threads** (10.3 s → 4.3 s); charge and particle number unchanged,
+energy to ~5e‑8 vs CPU.
+
+**Box + VDF** (`verify/config_box_VDF.yaml`, periodic 20³ lattice, 32 000 baryons,
+`End_Time=10`) — the mean‑field step alone (collisions off):
+
+| threads | CPU | GPU gather, **force CPU** | GPU gather+force |
+|---|---|---|---|
+| 1  | 3.34 s | **1.70 s — 1.97×** | 1.83 s — 1.83× |
+| 8  | 3.06 s | **1.45 s — 2.11×** | 1.62 s — 1.89× |
+| 16 | 3.15 s | **1.39 s — 2.27×** | 1.62 s — 1.94× |
+
+The gather makes the box mean‑field ~2× faster, and the gap *grows* with threads
+(the CPU gather scales poorly on this small lattice while the device gather is
+flat). Keeping the cheap VDF force on the CPU (`SMASH_GPU_FORCE=off`) is the
+fastest column at every thread count. The GPU box result conserves identically to
+the CPU (the built‑in 4‑momentum‑violation figure matches to the printed digit)
+and tracks the CPU trajectory to ~1e‑5 GeV.
+
+> **Collisions dilute the *end‑to‑end* gain.** `config_box_VDF.yaml` runs with
+> 2→2 collisions on, and for this dense box the collision finding/performing (CPU)
+> dominates the wall time. The **whole‑run** GPU speedup is therefore only **1.05×
+> (1t) → 1.24× (16t)**, even though the mean‑field step it accelerates is ~2×
+> faster — the GPU helps in proportion to the mean‑field fraction of your runtime.
 
 Standalone GPU kernels (gather, force/root‑find, a resident multi‑step loop) and
 their CUDA companions live in [`gpu/`](gpu/); design notes are in
@@ -197,7 +227,8 @@ Pythia 8.316; "evolution time" excludes the one‑time serial cache warm‑up):
 | **`Strings: True`, `Ensembles: 1`** *or* **low‑energy Collider** (strings never fire) | nothing parallelizes — one ensemble = no work to split, yet `OMP_NUM_THREADS` Pythia instances are still built; the strings flag also **disables** the cell‑parallel finder | **< 1× (slower than 1 thread)** | the common trap, e.g. Au+Au at `E_Kin: 1.23` GeV. Fix: set `Strings: False` (physically identical at that energy) and/or raise `Ensembles` — see callout below |
 | **`Ensembles: 1`, `Strings: False`, non‑stochastic criterion** | cell‑parallel pair search | 1.65× (2t), 2.66× (4t), 3.9× (8t) | `verify/box_heavy.yaml` with 1 ensemble |
 | **`Potentials:` (mean field)** | tabulated root‑find (deterministic) + **gather density fill for ≥ 4 threads** + node‑parallel force loops | 1.13× (1t, tabulation only), 1.54× (4t), **2.43× (8t)** | `input/potentials`, `verify/potentials_nomd.yaml`, `verify/potentials_md.yaml` |
-| **`Potentials:` + GPU detected** (Collider, Covariant Gaussian, `Gpu: auto`) | density lattice fill **and** (with `Momentum_Dependence:`) the force / root‑find offloaded to **Metal/CUDA** | **5.0× (1t), 2.4× (8t)** over the CPU mean‑field path at the same thread count *(M3 Max)* | engages **only** for non‑periodic (Collider) potentials runs with Covariant Gaussian smearing — box modus and non‑potentials runs are unaffected. `verify/potentials_md.yaml` |
+| **`Potentials:` + GPU detected** (Collider, Covariant Gaussian, `Gpu: auto`) | density lattice fill **and** the force (momentum‑dependent root‑find, or the Skyrme/VDF field lookup) offloaded to **Metal/CUDA** | **5.0× (1t), 2.4× (8t)** over the CPU mean‑field path at the same thread count *(M3 Max)* | engages for any Covariant‑Gaussian potentials run; non‑potentials runs unaffected. `verify/potentials_md.yaml` |
+| **`Potentials:` + GPU, Box modus** (periodic lattice, VDF/Skyrme) | the **periodic** density gather on the device (cell‑list wrapped mod cell count, minimum‑image); the cheap field force is best kept on the CPU (`SMASH_GPU_FORCE=off`) | **~2× mean‑field** (1.97× 1t → 2.27× 16t); whole‑run **1.05–1.24×** when 2→2 collisions are on (collision‑bound) *(M3 Max)* | new — lifts the old non‑periodic restriction. `verify/config_box_VDF.yaml` |
 
 Key mean‑field detail: the density smearing switches from the serial **scatter**
 to the node‑parallel **gather** only when **≥ 4 threads** are available (the
@@ -293,6 +324,7 @@ re‑derived. The small ones are reproduced here; the rest are in `input/` and
 | `potentials` | [input/potentials/config.yaml](input/potentials/config.yaml) | Collider, Cu+Cu, Skyrme + symmetry, 80³ lattice | no | mean‑field scatter→gather, force loops |
 | `potentials_md` | [verify/potentials_md.yaml](verify/potentials_md.yaml) | as above **+ momentum dependence** | no | mean‑field tabulation + gather (the 2.4× case) |
 | `potentials_nomd` | [verify/potentials_nomd.yaml](verify/potentials_nomd.yaml) | as `potentials`, no momentum dependence | no | mean‑field floor reference |
+| `box_VDF` | [verify/config_box_VDF.yaml](verify/config_box_VDF.yaml) | **Box (periodic)**, Covariant, VDF potential, 20³ lattice, 32 000 baryons | no | GPU mean‑field in the **box** modus (periodic gather + VDF field force) |
 
 Representative small configs, inline:
 
@@ -356,6 +388,16 @@ bash verify/scaling.sh strAu     verify/strings_heavy.yaml        8  8.0   1 2 4
 # --- Mean-field: root-find tabulation + thread-gated gather ----------------
 bash verify/tab_check.sh         # tabulation timing + conservation vs pre-tab
 bash verify/gather_check.sh      # scatter for T<4, gather for T>=4; conservation
+
+# --- GPU mean-field: compare "Time real" with SMASH_GPU=off vs on ----------
+# Collider, momentum-dependent (the GPU force also helps at low threads):
+OMP_NUM_THREADS=1 SMASH_GPU=off ./build/smash -i verify/potentials_md.yaml   -e 3  -o /tmp/md_cpu  -f -q
+OMP_NUM_THREADS=1 SMASH_GPU=on  ./build/smash -i verify/potentials_md.yaml   -e 3  -o /tmp/md_gpu  -f -q
+# Box + VDF (periodic gather); keep the cheap VDF force on the CPU. Append
+#   -c "Collision_Term: {No_Collisions: True}"  to time the mean-field alone
+#   (as-is the config runs 2->2 collisions and is collision-bound):
+OMP_NUM_THREADS=1 SMASH_GPU=off                    ./build/smash -i verify/config_box_VDF.yaml -e 10 -o /tmp/box_cpu -f -q
+OMP_NUM_THREADS=1 SMASH_GPU=on SMASH_GPU_FORCE=off ./build/smash -i verify/config_box_VDF.yaml -e 10 -o /tmp/box_gpu -f -q
 
 # --- GPU prototype (standalone) --------------------------------------------
 cd gpu && make run

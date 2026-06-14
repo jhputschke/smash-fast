@@ -31,6 +31,7 @@ struct GParams {
   int glx, gly, glz, gux, guy, guz;
   int n_src;
   int compute_gradient;
+  int periodic;
   float ox, oy, oz;
   float hx, hy, hz;
   float rcut;
@@ -38,7 +39,7 @@ struct GParams {
   float norm;
 };
 
-// Layout shared with the MSL `FParams` struct (force kernel).
+// Layout shared with the MSL `FParams` struct (momentum-dependent force kernel).
 struct FParams {
   int n_part;
   int nx, ny, nz;
@@ -47,6 +48,16 @@ struct FParams {
   float ox, oy, oz;
   float hx, hy, hz;
   float inv_dp, inv_drho, p_max, rho_max;
+  float dt;
+};
+
+// Layout shared with the MSL `FFieldParams` struct (Skyrme/VDF field force).
+struct FFieldParams {
+  int n_part;
+  int nx, ny, nz;
+  int periodic;
+  float ox, oy, oz;
+  float hx, hy, hz;
   float dt;
 };
 
@@ -64,12 +75,15 @@ struct GParams {
   int glx, gly, glz, gux, guy, guz;
   int n_src;
   int compute_gradient;
+  int periodic;
   float ox, oy, oz;
   float hx, hy, hz;
   float rcut;
   float two_sig_sqr_inv;
   float norm;
 };
+
+inline int pmod(int a, int n) { int m = a % n; return m < 0 ? m + n : m; }
 
 kernel void gather24(
     device const float* sx [[buffer(0)]],
@@ -97,21 +111,38 @@ kernel void gather24(
   float ncy = P.oy + ((float)iy + 0.5f) * P.hy;
   float ncz = P.oz + ((float)iz + 0.5f) * P.hz;
   float rcut2 = P.rcut * P.rcut;
-  int bcx = (int)floor((ncx - P.ox) / P.rcut);
-  int bcy = (int)floor((ncy - P.oy) / P.rcut);
-  int bcz = (int)floor((ncz - P.oz) / P.rcut);
+  // Box lengths (periodic only) and the node's home bin. Periodic bins evenly
+  // tile L (edge L/nb >= rcut); the open path uses edge = rcut.
+  float Lx = (float)P.nx * P.hx, Ly = (float)P.ny * P.hy, Lz = (float)P.nz * P.hz;
+  int bcx, bcy, bcz;
+  if (P.periodic) {
+    bcx = (int)floor((ncx - P.ox) * (float)P.nbx / Lx);
+    bcy = (int)floor((ncy - P.oy) * (float)P.nby / Ly);
+    bcz = (int)floor((ncz - P.oz) * (float)P.nbz / Lz);
+  } else {
+    bcx = (int)floor((ncx - P.ox) / P.rcut);
+    bcy = (int)floor((ncy - P.oy) / P.rcut);
+    bcz = (int)floor((ncz - P.oz) / P.rcut);
+  }
 
   float acc[24];
   for (int c = 0; c < 24; c++) acc[c] = 0.0f;
 
-  for (int dz = -1; dz <= 1; dz++) { int bz = bcz + dz; if (bz < 0 || bz >= P.nbz) continue;
-   for (int dy = -1; dy <= 1; dy++) { int by = bcy + dy; if (by < 0 || by >= P.nby) continue;
-    for (int dx = -1; dx <= 1; dx++) { int bx = bcx + dx; if (bx < 0 || bx >= P.nbx) continue;
+  for (int dz = -1; dz <= 1; dz++) { int bz = bcz + dz; if (P.periodic) bz = pmod(bz, P.nbz); else if (bz < 0 || bz >= P.nbz) continue;
+   for (int dy = -1; dy <= 1; dy++) { int by = bcy + dy; if (P.periodic) by = pmod(by, P.nby); else if (by < 0 || by >= P.nby) continue;
+    for (int dx = -1; dx <= 1; dx++) { int bx = bcx + dx; if (P.periodic) bx = pmod(bx, P.nbx); else if (bx < 0 || bx >= P.nbx) continue;
       int b = bx + P.nbx * (by + P.nby * bz);
       int kend = bin_start[b + 1];
       for (int k = bin_start[b]; k < kend; k++) {
         int p = bin_part[k];
         float rx = sx[p] - ncx, ry = sy[p] - ncy, rz = sz[p] - ncz;
+        // Minimum image: a particle near the opposite face smears across the
+        // periodic boundary (matches the CPU scatter's virtual-image center).
+        if (P.periodic) {
+          rx -= Lx * round(rx / Lx);
+          ry -= Ly * round(ry / Ly);
+          rz -= Lz * round(rz / Lz);
+        }
         float r2 = rx * rx + ry * ry + rz * rz;
         if (r2 > rcut2) continue;
         float pp0 = p0[p], ppx = px[p], ppy = py[p], ppz = pz[p];
@@ -281,13 +312,63 @@ kernel void force_kernel(
   float fz = -grad[2] * s1 + s2i * (f1z + cz);
   npx[i] = Px + fx * F.dt; npy[i] = Py + fy * F.dt; npz[i] = Pz + fz * F.dt;
 }
+
+// ---- Skyrme/VDF field force (device update_momenta, non-momentum branch) -----
+// force = scale1*(FB.first + v x FB.second) + scale2*iso3*(FI3.first + v x FI3.second),
+// with FB/FI3 read nearest-node (6 floats each). No root-find / U(p,rho) table.
+struct FFieldParams {
+  int n_part;
+  int nx, ny, nz;
+  int periodic;
+  float ox, oy, oz;
+  float hx, hy, hz;
+  float dt;
+};
+
+kernel void force_field_kernel(
+    device const float* rx [[buffer(0)]], device const float* ry [[buffer(1)]],
+    device const float* rz [[buffer(2)]], device const float* px [[buffer(3)]],
+    device const float* py [[buffer(4)]], device const float* pz [[buffer(5)]],
+    device const float* p0 [[buffer(6)]], device const float* scale1 [[buffer(7)]],
+    device const float* scale2 [[buffer(8)]], device const float* iso3 [[buffer(9)]],
+    device const int* active [[buffer(10)]], device const float* fB [[buffer(11)]],
+    device const float* fi3 [[buffer(12)]], constant FFieldParams& F [[buffer(13)]],
+    device float* npx [[buffer(14)]], device float* npy [[buffer(15)]],
+    device float* npz [[buffer(16)]], uint i [[thread_position_in_grid]]) {
+  if (i >= (uint)F.n_part) return;
+  float Px = px[i], Py = py[i], Pz = pz[i];
+  if (active[i] == 0) { npx[i] = Px; npy[i] = Py; npz[i] = Pz; return; }
+  int ix = (int)floor((rx[i] - F.ox) / F.hx);
+  int iy = (int)floor((ry[i] - F.oy) / F.hy);
+  int iz = (int)floor((rz[i] - F.oz) / F.hz);
+  if (F.periodic) {
+    ix = pmod(ix, F.nx); iy = pmod(iy, F.ny); iz = pmod(iz, F.nz);
+  } else if (ix < 0 || ix >= F.nx || iy < 0 || iy >= F.ny || iz < 0 || iz >= F.nz) {
+    npx[i] = Px; npy[i] = Py; npz[i] = Pz; return;  // outside lattice: unchanged
+  }
+  int node = (ix + F.nx * (iy + F.ny * iz)) * 6;
+  float b1x = fB[node], b1y = fB[node + 1], b1z = fB[node + 2];
+  float b2x = fB[node + 3], b2y = fB[node + 4], b2z = fB[node + 5];
+  float f1x = fi3[node], f1y = fi3[node + 1], f1z = fi3[node + 2];
+  float f2x = fi3[node + 3], f2y = fi3[node + 4], f2z = fi3[node + 5];
+  float P0 = p0[i];
+  float vx = Px / P0, vy = Py / P0, vz = Pz / P0;
+  float bcx = vy * b2z - vz * b2y, bcy = vz * b2x - vx * b2z, bcz = vx * b2y - vy * b2x;
+  float icx = vy * f2z - vz * f2y, icy = vz * f2x - vx * f2z, icz = vx * f2y - vy * f2x;
+  float s1 = scale1[i], s2i = scale2[i] * iso3[i];
+  float fx = s1 * (b1x + bcx) + s2i * (f1x + icx);
+  float fy = s1 * (b1y + bcy) + s2i * (f1y + icy);
+  float fz = s1 * (b1z + bcz) + s2i * (f1z + icz);
+  npx[i] = Px + fx * F.dt; npy[i] = Py + fy * F.dt; npz[i] = Pz + fz * F.dt;
+}
 )METAL";
 
 std::once_flag g_once;
 id<MTLDevice> g_device = nil;
 id<MTLCommandQueue> g_queue = nil;
-id<MTLComputePipelineState> g_pipe = nil;        // gather24
-id<MTLComputePipelineState> g_pipe_force = nil;  // force_kernel
+id<MTLComputePipelineState> g_pipe = nil;              // gather24
+id<MTLComputePipelineState> g_pipe_force = nil;        // force_kernel (md)
+id<MTLComputePipelineState> g_pipe_force_field = nil;  // force_field_kernel
 bool g_ok = false;
 
 void ensure_init() {
@@ -319,6 +400,13 @@ void ensure_init() {
                                                              error:&err];
       if (g_pipe_force == nil) {
         NSLog(@"[GPU] Metal force pipeline failed: %@", err);
+        return;
+      }
+      g_pipe_force_field = [g_device newComputePipelineStateWithFunction:
+                                [lib newFunctionWithName:@"force_field_kernel"]
+                                                                  error:&err];
+      if (g_pipe_force_field == nil) {
+        NSLog(@"[GPU] Metal field-force pipeline failed: %@", err);
         return;
       }
       g_ok = true;
@@ -361,8 +449,9 @@ bool backend_gather(const GatherJob &job) {
 
     GParams P{job.nx, job.ny, job.nz, job.nbx, job.nby, job.nbz,
               job.glx, job.gly, job.glz, job.gux, job.guy, job.guz,
-              job.n_src, job.compute_gradient, job.ox, job.oy, job.oz,
-              job.hx, job.hy, job.hz, job.rcut, job.two_sig_sqr_inv, job.norm};
+              job.n_src, job.compute_gradient, job.periodic, job.ox, job.oy,
+              job.oz, job.hx, job.hy, job.hz, job.rcut, job.two_sig_sqr_inv,
+              job.norm};
 
     id<MTLBuffer> b_sx = buf_f(job.sx, job.n_src);
     id<MTLBuffer> b_sy = buf_f(job.sy, job.n_src);
@@ -406,10 +495,67 @@ bool backend_gather(const GatherJob &job) {
   return true;
 }
 
+// Skyrme/VDF field force (job.momentum_dependent == 0). Assumes ensure_init()
+// already succeeded (checked by backend_force).
+bool backend_force_field(const ForceJob &job) {
+  @autoreleasepool {
+    const long n_nodes = static_cast<long>(job.nx) * job.ny * job.nz;
+    const int N = job.n_part;
+    FFieldParams F{N, job.nx, job.ny, job.nz, job.periodic, job.ox, job.oy,
+                   job.oz, job.hx, job.hy, job.hz, job.dt};
+
+    id<MTLBuffer> b[14];
+    b[0] = buf_f(job.rx, N); b[1] = buf_f(job.ry, N); b[2] = buf_f(job.rz, N);
+    b[3] = buf_f(job.px, N); b[4] = buf_f(job.py, N); b[5] = buf_f(job.pz, N);
+    b[6] = buf_f(job.p0, N); b[7] = buf_f(job.scale1, N);
+    b[8] = buf_f(job.scale2, N); b[9] = buf_f(job.iso3, N);
+    b[10] = buf_i(job.active, N); b[11] = buf_f(job.fB, 6 * n_nodes);
+    b[12] = buf_f(job.fi3, 6 * n_nodes);
+    b[13] = [g_device newBufferWithBytes:&F
+                                 length:sizeof(FFieldParams)
+                                options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b_npx =
+        [g_device newBufferWithLength:sizeof(float) * static_cast<NSUInteger>(N)
+                              options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b_npy =
+        [g_device newBufferWithLength:sizeof(float) * static_cast<NSUInteger>(N)
+                              options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b_npz =
+        [g_device newBufferWithLength:sizeof(float) * static_cast<NSUInteger>(N)
+                              options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:g_pipe_force_field];
+    for (int k = 0; k < 14; k++) {
+      [enc setBuffer:b[k] offset:0 atIndex:k];
+    }
+    [enc setBuffer:b_npx offset:0 atIndex:14];
+    [enc setBuffer:b_npy offset:0 atIndex:15];
+    [enc setBuffer:b_npz offset:0 atIndex:16];
+    NSUInteger tpt = g_pipe_force_field.maxTotalThreadsPerThreadgroup;
+    if (tpt > 256) tpt = 256;
+    [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(N), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    const size_t nb = sizeof(float) * static_cast<size_t>(N);
+    std::memcpy(job.npx, b_npx.contents, nb);
+    std::memcpy(job.npy, b_npy.contents, nb);
+    std::memcpy(job.npz, b_npz.contents, nb);
+  }
+  return true;
+}
+
 bool backend_force(const ForceJob &job) {
   ensure_init();
   if (!g_ok) {
     return false;
+  }
+  if (!job.momentum_dependent) {
+    return backend_force_field(job);
   }
   @autoreleasepool {
     const long n_nodes = static_cast<long>(job.nx) * job.ny * job.nz;

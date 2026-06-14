@@ -23,6 +23,8 @@
 
 namespace {
 
+__device__ inline int pmod(int a, int n) { int m = a % n; return m < 0 ? m + n : m; }
+
 __global__ void gather24(const float *sx, const float *sy, const float *sz,
                          const float *p0, const float *px, const float *py,
                          const float *pz, const float *dfac,
@@ -31,7 +33,7 @@ __global__ void gather24(const float *sx, const float *sy, const float *sz,
                          int gly, int glz, int gux, int guy, int guz, float ox,
                          float oy, float oz, float hx, float hy, float hz,
                          float rcut, float two_sig_sqr_inv, float norm,
-                         int compute_gradient, float *out) {
+                         int compute_gradient, int periodic, float *out) {
   const int bxn = gux - glx, byn = guy - gly, bzn = guz - glz;
   const long n_box = (long)bxn * byn * bzn;
   long tid = blockIdx.x * (long)blockDim.x + threadIdx.x;
@@ -45,21 +47,38 @@ __global__ void gather24(const float *sx, const float *sy, const float *sz,
   float ncy = oy + ((float)iy + 0.5f) * hy;
   float ncz = oz + ((float)iz + 0.5f) * hz;
   float rcut2 = rcut * rcut;
-  int bcx = (int)floorf((ncx - ox) / rcut);
-  int bcy = (int)floorf((ncy - oy) / rcut);
-  int bcz = (int)floorf((ncz - oz) / rcut);
+  // Box lengths (periodic only) and the node's home bin. Periodic bins evenly
+  // tile L (edge L/nb >= rcut); the open path uses edge = rcut.
+  float Lx = (float)nx * hx, Ly = (float)ny * hy, Lz = (float)nz * hz;
+  int bcx, bcy, bcz;
+  if (periodic) {
+    bcx = (int)floorf((ncx - ox) * (float)nbx / Lx);
+    bcy = (int)floorf((ncy - oy) * (float)nby / Ly);
+    bcz = (int)floorf((ncz - oz) * (float)nbz / Lz);
+  } else {
+    bcx = (int)floorf((ncx - ox) / rcut);
+    bcy = (int)floorf((ncy - oy) / rcut);
+    bcz = (int)floorf((ncz - oz) / rcut);
+  }
 
   float acc[24];
   for (int c = 0; c < 24; c++) acc[c] = 0.0f;
 
-  for (int dz = -1; dz <= 1; dz++) { int bz = bcz + dz; if (bz < 0 || bz >= nbz) continue;
-   for (int dy = -1; dy <= 1; dy++) { int by = bcy + dy; if (by < 0 || by >= nby) continue;
-    for (int dx = -1; dx <= 1; dx++) { int bx = bcx + dx; if (bx < 0 || bx >= nbx) continue;
+  for (int dz = -1; dz <= 1; dz++) { int bz = bcz + dz; if (periodic) bz = pmod(bz, nbz); else if (bz < 0 || bz >= nbz) continue;
+   for (int dy = -1; dy <= 1; dy++) { int by = bcy + dy; if (periodic) by = pmod(by, nby); else if (by < 0 || by >= nby) continue;
+    for (int dx = -1; dx <= 1; dx++) { int bx = bcx + dx; if (periodic) bx = pmod(bx, nbx); else if (bx < 0 || bx >= nbx) continue;
       int b = bx + nbx * (by + nby * bz);
       int kend = bin_start[b + 1];
       for (int k = bin_start[b]; k < kend; k++) {
         int p = bin_part[k];
         float rx = sx[p] - ncx, ry = sy[p] - ncy, rz = sz[p] - ncz;
+        // Minimum image: a particle near the opposite face smears across the
+        // periodic boundary (matches the CPU scatter's virtual-image center).
+        if (periodic) {
+          rx -= Lx * roundf(rx / Lx);
+          ry -= Ly * roundf(ry / Ly);
+          rz -= Lz * roundf(rz / Lz);
+        }
         float r2 = rx * rx + ry * ry + rz * rz;
         if (r2 > rcut2) continue;
         float pp0 = p0[p], ppx = px[p], ppy = py[p], ppz = pz[p];
@@ -213,6 +232,46 @@ __global__ void force_kernel(const float *rx, const float *ry, const float *rz,
   npz[i] = Pz + (-grad[2] * s1 + s2i * (f1z + cz)) * dt;
 }
 
+// ---- Skyrme/VDF field force (device update_momenta, non-momentum branch) -----
+// force = scale1*(FB.first + v x FB.second) + scale2*iso3*(FI3.first + v x FI3.second),
+// with FB/FI3 read nearest-node (6 floats each). No root-find / U(p,rho) table.
+__global__ void force_field_kernel(const float *rx, const float *ry,
+                                   const float *rz, const float *px,
+                                   const float *py, const float *pz,
+                                   const float *p0, const float *scale1,
+                                   const float *scale2, const float *iso3,
+                                   const int *active, const float *fB,
+                                   const float *fi3, int n_part, int nx, int ny,
+                                   int nz, int periodic, float ox, float oy,
+                                   float oz, float hx, float hy, float hz,
+                                   float dt, float *npx, float *npy,
+                                   float *npz) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_part) return;
+  float Px = px[i], Py = py[i], Pz = pz[i];
+  if (active[i] == 0) { npx[i] = Px; npy[i] = Py; npz[i] = Pz; return; }
+  int ix = (int)floorf((rx[i] - ox) / hx), iy = (int)floorf((ry[i] - oy) / hy),
+      iz = (int)floorf((rz[i] - oz) / hz);
+  if (periodic) {
+    ix = pmod(ix, nx); iy = pmod(iy, ny); iz = pmod(iz, nz);
+  } else if (ix < 0 || ix >= nx || iy < 0 || iy >= ny || iz < 0 || iz >= nz) {
+    npx[i] = Px; npy[i] = Py; npz[i] = Pz; return;  // outside lattice: unchanged
+  }
+  int node = (ix + nx * (iy + ny * iz)) * 6;
+  float b1x = fB[node], b1y = fB[node + 1], b1z = fB[node + 2];
+  float b2x = fB[node + 3], b2y = fB[node + 4], b2z = fB[node + 5];
+  float f1x = fi3[node], f1y = fi3[node + 1], f1z = fi3[node + 2];
+  float f2x = fi3[node + 3], f2y = fi3[node + 4], f2z = fi3[node + 5];
+  float P0 = p0[i];
+  float vx = Px / P0, vy = Py / P0, vz = Pz / P0;
+  float bcx = vy * b2z - vz * b2y, bcy = vz * b2x - vx * b2z, bcz = vx * b2y - vy * b2x;
+  float icx = vy * f2z - vz * f2y, icy = vz * f2x - vx * f2z, icz = vx * f2y - vy * f2x;
+  float s1 = scale1[i], s2i = scale2[i] * iso3[i];
+  npx[i] = Px + (s1 * (b1x + bcx) + s2i * (f1x + icx)) * dt;
+  npy[i] = Py + (s1 * (b1y + bcy) + s2i * (f1y + icy)) * dt;
+  npz[i] = Pz + (s1 * (b1z + bcz) + s2i * (f1z + icz)) * dt;
+}
+
 template <typename T>
 T *up(const T *h, long n) {
   T *d = nullptr;
@@ -255,7 +314,7 @@ bool backend_gather(const GatherJob &job) {
                             job.glx, job.gly, job.glz, job.gux, job.guy, job.guz,
                             job.ox, job.oy, job.oz, job.hx, job.hy, job.hz,
                             job.rcut, job.two_sig_sqr_inv, job.norm,
-                            job.compute_gradient, dout);
+                            job.compute_gradient, job.periodic, dout);
   cudaError_t err = cudaDeviceSynchronize();
   bool ok = (err == cudaSuccess);
   if (ok) {
@@ -269,7 +328,46 @@ bool backend_gather(const GatherJob &job) {
   return ok;
 }
 
+// Skyrme/VDF field force (job.momentum_dependent == 0).
+bool backend_force_field(const ForceJob &job) {
+  const long n_nodes = (long)job.nx * job.ny * job.nz;
+  const int N = job.n_part;
+  float *drx = up(job.rx, N), *dry = up(job.ry, N), *drz = up(job.rz, N),
+        *dpx = up(job.px, N), *dpy = up(job.py, N), *dpz = up(job.pz, N),
+        *dp0 = up(job.p0, N), *ds1 = up(job.scale1, N), *ds2 = up(job.scale2, N),
+        *di3 = up(job.iso3, N), *dfB = up(job.fB, 6 * n_nodes),
+        *dfi3 = up(job.fi3, 6 * n_nodes);
+  int *dact = up(job.active, N);
+  float *dnpx, *dnpy, *dnpz;
+  cudaMalloc(&dnpx, N * sizeof(float));
+  cudaMalloc(&dnpy, N * sizeof(float));
+  cudaMalloc(&dnpz, N * sizeof(float));
+  int tpb = 128, blocks = (N + tpb - 1) / tpb;
+  force_field_kernel<<<blocks, tpb>>>(drx, dry, drz, dpx, dpy, dpz, dp0, ds1,
+                                      ds2, di3, dact, dfB, dfi3, N, job.nx,
+                                      job.ny, job.nz, job.periodic, job.ox,
+                                      job.oy, job.oz, job.hx, job.hy, job.hz,
+                                      job.dt, dnpx, dnpy, dnpz);
+  cudaError_t err = cudaDeviceSynchronize();
+  bool ok = (err == cudaSuccess);
+  if (ok) {
+    cudaMemcpy(job.npx, dnpx, N * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(job.npy, dnpy, N * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(job.npz, dnpz, N * sizeof(float), cudaMemcpyDeviceToHost);
+  } else {
+    printf("[GPU] CUDA field force failed: %s\n", cudaGetErrorString(err));
+  }
+  cudaFree(drx); cudaFree(dry); cudaFree(drz); cudaFree(dpx); cudaFree(dpy);
+  cudaFree(dpz); cudaFree(dp0); cudaFree(ds1); cudaFree(ds2); cudaFree(di3);
+  cudaFree(dfB); cudaFree(dfi3); cudaFree(dact);
+  cudaFree(dnpx); cudaFree(dnpy); cudaFree(dnpz);
+  return ok;
+}
+
 bool backend_force(const ForceJob &job) {
+  if (!job.momentum_dependent) {
+    return backend_force_field(job);
+  }
   const long n_nodes = (long)job.nx * job.ny * job.nz;
   const int N = job.n_part;
   float *drx = up(job.rx, N), *dry = up(job.ry, N), *drz = up(job.rz, N),

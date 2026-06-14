@@ -1026,16 +1026,38 @@ inline bool gather_on_gpu(RectangularLattice<DensityOnLattice> *lat,
     return true;  // lattice already reset() to zero -- nothing to gather
   }
 
-  // Uniform cell-list, bin edge = r_cut (world units): every node sees all its
-  // r_cut neighbours within +-1 bin.
+  const bool periodic = lat->periodic();
+
+  // Uniform cell-list. Non-periodic: bin edge = r_cut (world units), nbin =
+  // floor(L/r_cut)+1, so every node sees all its r_cut neighbours within +-1
+  // bin. Periodic (Box): bins evenly tile each box length L=n_cells*csize with
+  // edge L/nbin >= r_cut, and the kernel wraps the +-1 neighbourhood modulo
+  // nbin. The wrap reproduces the periodic scatter only with >=3 distinct bins
+  // per axis (so the three offsets never alias); if any axis is too short
+  // (r_cut > L/3, i.e. 2*r_cut not < L) fall back to the CPU scatter, which
+  // already sums the multiple periodic images correctly.
   std::array<int, 3> nbin;
   for (int i = 0; i < 3; i++) {
-    nbin[i] = static_cast<int>(std::floor(n_cells[i] * csize[i] / r_cut)) + 1;
-    if (nbin[i] < 1) {
-      nbin[i] = 1;
+    const double L = n_cells[i] * csize[i];
+    if (periodic) {
+      nbin[i] = static_cast<int>(std::floor(L / r_cut));
+      if (nbin[i] < 3) {
+        return false;  // too few bins for a safe periodic wrap; use scatter
+      }
+    } else {
+      nbin[i] = static_cast<int>(std::floor(L / r_cut)) + 1;
+      if (nbin[i] < 1) {
+        nbin[i] = 1;
+      }
     }
   }
   auto bin_axis = [&](float v, int a) {
+    if (periodic) {
+      const double L = n_cells[a] * csize[a];
+      int b = static_cast<int>(std::floor((v - origin[a]) * nbin[a] / L));
+      b %= nbin[a];
+      return b < 0 ? b + nbin[a] : b;
+    }
     int b = static_cast<int>(std::floor((v - origin[a]) / r_cut));
     return b < 0 ? 0 : (b >= nbin[a] ? nbin[a] - 1 : b);
   };
@@ -1055,25 +1077,33 @@ inline bool gather_on_gpu(RectangularLattice<DensityOnLattice> *lat,
     bin_part[cursor[bin_of[i]]++] = i;
   }
 
-  // Occupied node bounding box [gl, gu): same cube formula as the CPU gather.
+  // Occupied node box [gl, gu). Periodic: every node can receive a contribution
+  // via wrapping, so iterate the whole (small, dense) box lattice. Non-periodic:
+  // the union of the smearing cubes (same cube formula as the CPU gather), so
+  // the empty collider region is skipped.
   std::array<int, 3> gl = {n_cells[0], n_cells[1], n_cells[2]};
   std::array<int, 3> gu = {0, 0, 0};
-  for (int i = 0; i < n_src; i++) {
-    const float pp[3] = {sx[i], sy[i], sz[i]};
-    for (int a = 0; a < 3; a++) {
-      int l = static_cast<int>(
-          std::ceil((pp[a] - origin[a] - r_cut) / csize[a] - 0.5));
-      int u = static_cast<int>(
-          std::ceil((pp[a] - origin[a] + r_cut) / csize[a] - 0.5));
-      if (l < 0) l = 0;
-      if (u > n_cells[a]) u = n_cells[a];
-      if (l < gl[a]) gl[a] = l;
-      if (u > gu[a]) gu[a] = u;
+  if (periodic) {
+    gl = {0, 0, 0};
+    gu = n_cells;
+  } else {
+    for (int i = 0; i < n_src; i++) {
+      const float pp[3] = {sx[i], sy[i], sz[i]};
+      for (int a = 0; a < 3; a++) {
+        int l = static_cast<int>(
+            std::ceil((pp[a] - origin[a] - r_cut) / csize[a] - 0.5));
+        int u = static_cast<int>(
+            std::ceil((pp[a] - origin[a] + r_cut) / csize[a] - 0.5));
+        if (l < 0) l = 0;
+        if (u > n_cells[a]) u = n_cells[a];
+        if (l < gl[a]) gl[a] = l;
+        if (u > gu[a]) gu[a] = u;
+      }
     }
-  }
-  for (int a = 0; a < 3; a++) {
-    if (gu[a] <= gl[a]) {
-      return true;  // all cubes fell outside the lattice
+    for (int a = 0; a < 3; a++) {
+      if (gu[a] <= gl[a]) {
+        return true;  // all cubes fell outside the lattice
+      }
     }
   }
 
@@ -1100,6 +1130,7 @@ inline bool gather_on_gpu(RectangularLattice<DensityOnLattice> *lat,
   job.compute_gradient = do_derivatives ? 1 : 0;
   job.glx = gl[0]; job.gly = gl[1]; job.glz = gl[2];
   job.gux = gu[0]; job.guy = gu[1]; job.guz = gu[2];
+  job.periodic = periodic ? 1 : 0;
   job.out = out.data();
   if (!gpu::run_gather(job)) {
     return false;
@@ -1131,9 +1162,12 @@ void update_lattice_accumulating_ensembles(
   // mean-field step). Bypasses the OpenMP thread-gate below. Falls back to the
   // CPU path if the backend declines.
   if constexpr (std::is_same_v<T, DensityOnLattice>) {
-    if (gpu::enabled() && !lat->periodic() &&
+    if (gpu::enabled() &&
         par.smearing() == SmearingMode::CovariantGaussian) {
       lat->reset();
+      // gather_on_gpu() handles both the open (collider) and periodic (Box)
+      // lattice; it declines (returns false) when the periodic wrap is unsafe
+      // (too few cell-list bins), and we then fall through to the CPU scatter.
       if (gather_on_gpu(lat, dens_type, par, ensembles, compute_gradient)) {
         return;
       }

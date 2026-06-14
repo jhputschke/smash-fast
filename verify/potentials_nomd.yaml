@@ -7,7 +7,7 @@ General:
     Time_Step_Mode: Fixed
     Delta_Time:    0.1
     End_Time:      50.0
-    Randomseed:    -1
+    Randomseed:    12345
     Nevents:       1
     Testparticles: 10
     Ensembles: 20

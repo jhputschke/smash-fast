@@ -83,6 +83,15 @@ struct GatherJob {
   float norm;                                      ///< Gaussian normalisation
   int compute_gradient;                            ///< also fill djmu_dxnu
   int glx, gly, glz, gux, guy, guz;                ///< occupied node box [gl,gu)
+  /**
+   * Periodic-lattice (Box) flag. When set, the cell-list bins evenly tile each
+   * box length \c L=nx*hx (edge \c L/nbx >= rcut, host guarantees nbx>=3), the
+   * kernel wraps the +-1 bin neighbourhood modulo nb*, and the per-pair
+   * displacement uses the minimum image (\c rx -= Lx*round(rx/Lx)). This
+   * reproduces the periodic CPU scatter for \c 2*rcut < L. When clear the bins,
+   * neighbourhood and displacement are the open (collider) versions.
+   */
+  int periodic;
   float *out;                                      ///< 24 * nx*ny*nz, zeroed
 };
 
@@ -103,25 +112,38 @@ bool run_gather(const GatherJob &job);
  *
  * `active[i]==0` (non-baryon) or a position outside the lattice leaves the
  * momentum unchanged. Output is the new three-momentum per particle.
+ *
+ * Two force variants share this struct, selected by \c momentum_dependent:
+ * - \c 1 : the momentum-dependent root-find/energy-gradient path described above
+ *          (uses \c jB and the U(p,rho) table).
+ * - \c 0 : the lattice **field** force for (non-momentum) Skyrme / VDF, the
+ *          device version of update_momenta()'s field-lookup branch:
+ *          force = scale1*(FB.first + v x FB.second)
+ *                + scale2*iso3*(FI3.first + v x FI3.second),
+ *          with FB read nearest-node from \c fB (6 floats/node). Uses neither
+ *          \c jB, \c U, nor \c meff.
  */
 struct ForceJob {
   int n_part;
   const float *rx, *ry, *rz;       ///< positions [fm]
   const float *px, *py, *pz;       ///< three-momentum [GeV]
   const float *p0;                 ///< energy [GeV] (for the velocity)
-  const float *meff;               ///< effective mass [GeV]
+  const float *meff;               ///< effective mass [GeV] (md path only)
   const float *scale1, *scale2;    ///< Potentials::force_scale().first/.second
   const float *iso3;               ///< isospin3_rel per particle
   const int *active;               ///< 1 for baryons/nuclei, else 0
-  const float *jB;                 ///< net baryon current, 4*n_nodes (nearest)
+  const float *jB;                 ///< net baryon current, 4*n_nodes (md path)
   const float *fi3;                ///< symmetry field, 6*n_nodes (first,second)
+  const float *fB;                 ///< Skyrme/VDF force field, 6*n_nodes (field path)
   int nx, ny, nz;                  ///< lattice cells per axis
   float ox, oy, oz;                ///< lattice origin [fm]
   float hx, hy, hz;                ///< cell sizes [fm]
-  const float *U;                  ///< U(p,rho) table, n_p*n_rho
-  int n_p, n_rho;                  ///< table dimensions
-  float inv_dp, inv_drho, p_max, rho_max;  ///< table grid
-  int niter;                       ///< bisection iterations
+  const float *U;                  ///< U(p,rho) table, n_p*n_rho (md path)
+  int n_p, n_rho;                  ///< table dimensions (md path)
+  float inv_dp, inv_drho, p_max, rho_max;  ///< table grid (md path)
+  int niter;                       ///< bisection iterations (md path)
+  int momentum_dependent;          ///< 1: root-find path; 0: field-lookup path
+  int periodic;                    ///< periodic lattice: wrap the node index
   float dt;                        ///< time step [fm]
   float *npx, *npy, *npz;          ///< output new three-momentum [GeV]
 };

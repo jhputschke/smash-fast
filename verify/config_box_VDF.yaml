@@ -1,0 +1,61 @@
+Logging:
+    default: INFO
+
+General:
+    Modus:          Box
+    Time_Step_Mode: Fixed 
+    Delta_Time:     0.1
+    End_Time:       5.0
+    Randomseed:     12345
+    Nevents:        1
+    Ensembles:      1
+    Testparticles:  100
+    #
+    Smearing_Mode:         Covariant Gaussian
+    Derivatives_Mode:      Finite difference
+    Gauss_Cutoff_In_Sigma: 2.0 
+
+Collision_Term:
+    #No_Collisions: True
+    Included_2to2:  ["All"]
+    Pauli_Blocking:
+        Spatial_Averaging_Radius:    1.86
+        Momentum_Averaging_Radius:   0.08
+        Gaussian_Cutoff:             2.2
+
+Output:
+    Output_Interval: 5.0
+    Particles:
+        Format:      ["Root"]
+        Only_Final:  Yes
+
+Modi:
+    Box:
+        Length: 20.0
+        Temperature: 0.001
+        Initial_Condition: "thermal momenta quantum"
+        Start_Time: 0.0
+        Init_Multiplicities:
+            #2112: 20
+            #2212: 20   # this gives density of 0.25 * 0.160 fm^-3 in the 10 fm box
+            2112: 160
+            2212: 160   # this gives density of 0.25 * 0.160 fm^-3 in the 20 fm box
+
+Lattice:
+    Automatic: False
+    Periodic: True
+    Origin:      [0.0, 0.0, 0.0]
+    Sizes:       [20.0, 20.0, 20.0]
+    Cell_Number: [20, 20, 20]
+    Potentials_Affect_Thresholds: True
+
+Potentials:
+    VDF:
+        # E_0 = -16.3 MeV, K_0 = 210 MeV
+        #Sat_rhoB: 0.160
+        #Powers: [2.0, 2.19353]
+        #Coeffs: [-321.907, 269.423]
+        # E_0 = -16.3 MeV, K_0 = 380 MeV 
+        Sat_rhoB: 0.160
+        Powers: [2.0, 2.98815]
+        Coeffs: [-124.367, 71.8833]
