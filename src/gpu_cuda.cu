@@ -385,6 +385,72 @@ T *up(BufPool &p, const T *h, long n) {
   return d;
 }
 
+// One grow-only PAGE-LOCKED host allocation, reused across calls (cudaFreeHost on
+// grow). Page-locked staging is what makes the discrete-path copies (a) run at
+// full PCIe bandwidth — pageable cudaMemcpy tops out at ~half, since the driver
+// bounces it through a hidden pinned buffer — and (b) issuable async
+// (cudaMemcpyAsync) so transfer overlaps compute instead of serialising on the
+// default stream. (Item 2 in CudaNextSteps.md.) Discrete path only; the ATS path
+// never copies.
+struct PinBuf {
+  void *h = nullptr;
+  size_t cap = 0;
+  void *ensure(size_t bytes) {
+    if (bytes > cap) {
+      if (h) cudaFreeHost(h);
+      cudaHostAlloc(&h, bytes, cudaHostAllocDefault);
+      cap = bytes;
+    }
+    return h;
+  }
+};
+
+// Pinned analogue of BufPool: same fixed-order hand-out, so the caps converge
+// after the first call and no further pinned allocation happens.
+struct PinPool {
+  std::vector<PinBuf> bufs;
+  size_t idx = 0;
+  void reset() { idx = 0; }
+  void *take(size_t bytes) {
+    if (idx >= bufs.size()) bufs.emplace_back();
+    return bufs[idx++].ensure(bytes);
+  }
+};
+
+// The discrete path's persistent stream. All backends serialise on g_mutex, so a
+// single shared non-default stream is enough; issuing the copies and the kernel on
+// it (rather than the default stream) is what lets the driver overlap H2D / kernel
+// / D2H, and is the unit a future CUDA-graph capture (item 4) replays.
+cudaStream_t disc_stream() {
+  static cudaStream_t s = nullptr;
+  if (!s) cudaStreamCreate(&s);
+  return s;
+}
+
+// Stage host -> pinned -> device, async on the stream. The host->pinned leg is a
+// plain DRAM memcpy (full speed, no PCIe); the pinned->device leg is the one that
+// crosses PCIe, now at full bandwidth and overlappable with the kernel that the
+// caller subsequently launches on the same stream.
+template <typename T>
+T *up_async(BufPool &dp, PinPool &hp, const T *h, long n, cudaStream_t s) {
+  const size_t bytes = (size_t)n * sizeof(T);
+  void *pin = hp.take(bytes);
+  std::memcpy(pin, h, bytes);
+  T *d = static_cast<T *>(dp.take(bytes));
+  cudaMemcpyAsync(d, pin, bytes, cudaMemcpyHostToDevice, s);
+  return d;
+}
+
+// Async D2H of `bytes` from device `src` into the SMASH-owned host buffer `dst`,
+// staged through pinned memory `hp` so the copy runs at full bandwidth on the
+// stream. Returns the pinned slot; the caller copies it out after the stream
+// syncs (the host->dst leg can only run once the D2H has completed).
+inline void *down_async(PinPool &hp, void *src, size_t bytes, cudaStream_t s) {
+  void *pin = hp.take(bytes);
+  cudaMemcpyAsync(pin, src, bytes, cudaMemcpyDeviceToHost, s);
+  return pin;
+}
+
 // Block size that maximises theoretical occupancy for the given kernel on the
 // active device, accounting for its register/shared-memory use (so the heavier
 // FP64-accumulator gather is sized differently from the lighter force kernels,
@@ -428,21 +494,27 @@ bool backend_gather(const GatherJob &job) {
   const int *bs, *bp;
   float *out;
   static BufPool pool;
+  static PinPool pin;
+  cudaStream_t stream = ats ? (cudaStream_t)0 : disc_stream();
   if (ats) {
     sx = job.sx; sy = job.sy; sz = job.sz; p0 = job.p0;
     px = job.px; py = job.py; pz = job.pz; df = job.dfac;
     bs = job.bin_start; bp = job.bin_part;
     out = job.out;  // host already zeroed it (only [gl,gu) is read back)
   } else {
-    pool.reset();
-    sx = up(pool, job.sx, job.n_src); sy = up(pool, job.sy, job.n_src);
-    sz = up(pool, job.sz, job.n_src); p0 = up(pool, job.p0, job.n_src);
-    px = up(pool, job.px, job.n_src); py = up(pool, job.py, job.n_src);
-    pz = up(pool, job.pz, job.n_src); df = up(pool, job.dfac, job.n_src);
-    bs = up(pool, job.bin_start, n_bins + 1);
-    bp = up(pool, job.bin_part, job.n_src);
+    pool.reset(); pin.reset();
+    sx = up_async(pool, pin, job.sx, job.n_src, stream);
+    sy = up_async(pool, pin, job.sy, job.n_src, stream);
+    sz = up_async(pool, pin, job.sz, job.n_src, stream);
+    p0 = up_async(pool, pin, job.p0, job.n_src, stream);
+    px = up_async(pool, pin, job.px, job.n_src, stream);
+    py = up_async(pool, pin, job.py, job.n_src, stream);
+    pz = up_async(pool, pin, job.pz, job.n_src, stream);
+    df = up_async(pool, pin, job.dfac, job.n_src, stream);
+    bs = up_async(pool, pin, job.bin_start, n_bins + 1, stream);
+    bp = up_async(pool, pin, job.bin_part, job.n_src, stream);
     out = static_cast<float *>(pool.take(24 * n_nodes * sizeof(float)));
-    cudaMemset(out, 0, 24 * n_nodes * sizeof(float));
+    cudaMemsetAsync(out, 0, 24 * n_nodes * sizeof(float), stream);
   }
 
   // Dispatch the FP32 or FP64 accumulator instantiation; each caches its own
@@ -455,19 +527,27 @@ bool backend_gather(const GatherJob &job) {
   if (use_fp64_acc()) {
     static int tpb = best_block_size(gather24<double>);
     long blocks = (n_box + tpb - 1) / tpb;
-    gather24<double><<<blocks, tpb>>>(GATHER_ARGS);
+    gather24<double><<<blocks, tpb, 0, stream>>>(GATHER_ARGS);
   } else {
     static int tpb = best_block_size(gather24<float>);
     long blocks = (n_box + tpb - 1) / tpb;
-    gather24<float><<<blocks, tpb>>>(GATHER_ARGS);
+    gather24<float><<<blocks, tpb, 0, stream>>>(GATHER_ARGS);
   }
 #undef GATHER_ARGS
-  cudaError_t err = cudaDeviceSynchronize();
+  // ATS: nothing to copy back, just drain the default stream. Discrete: async D2H
+  // through pinned staging, then sync the stream and copy out to the host array.
+  cudaError_t err;
+  if (ats) {
+    err = cudaDeviceSynchronize();
+  } else {
+    const size_t obytes = 24 * (size_t)n_nodes * sizeof(float);
+    void *pout = down_async(pin, out, obytes, stream);
+    err = cudaStreamSynchronize(stream);
+    if (err == cudaSuccess) std::memcpy(job.out, pout, obytes);
+  }
   bool ok = (err == cudaSuccess);
   if (!ok) {
     printf("[GPU] CUDA gather failed: %s\n", cudaGetErrorString(err));
-  } else if (!ats) {
-    cudaMemcpy(job.out, out, 24 * n_nodes * sizeof(float), cudaMemcpyDeviceToHost);
   }
   return ok;
 }
@@ -482,19 +562,28 @@ bool backend_force_field(const ForceJob &job) {
   const int *act;
   float *npx, *npy, *npz;
   static BufPool pool;
+  static PinPool pin;
+  cudaStream_t stream = ats ? (cudaStream_t)0 : disc_stream();
   if (ats) {
     rx = job.rx; ry = job.ry; rz = job.rz; px = job.px; py = job.py; pz = job.pz;
     p0 = job.p0; s1 = job.scale1; s2 = job.scale2; i3 = job.iso3;
     fB = job.fB; fi3 = job.fi3; act = job.active;
     npx = job.npx; npy = job.npy; npz = job.npz;
   } else {
-    pool.reset();
-    rx = up(pool, job.rx, N); ry = up(pool, job.ry, N); rz = up(pool, job.rz, N);
-    px = up(pool, job.px, N); py = up(pool, job.py, N); pz = up(pool, job.pz, N);
-    p0 = up(pool, job.p0, N); s1 = up(pool, job.scale1, N);
-    s2 = up(pool, job.scale2, N); i3 = up(pool, job.iso3, N);
-    fB = up(pool, job.fB, 6 * n_nodes); fi3 = up(pool, job.fi3, 6 * n_nodes);
-    act = up(pool, job.active, N);
+    pool.reset(); pin.reset();
+    rx = up_async(pool, pin, job.rx, N, stream);
+    ry = up_async(pool, pin, job.ry, N, stream);
+    rz = up_async(pool, pin, job.rz, N, stream);
+    px = up_async(pool, pin, job.px, N, stream);
+    py = up_async(pool, pin, job.py, N, stream);
+    pz = up_async(pool, pin, job.pz, N, stream);
+    p0 = up_async(pool, pin, job.p0, N, stream);
+    s1 = up_async(pool, pin, job.scale1, N, stream);
+    s2 = up_async(pool, pin, job.scale2, N, stream);
+    i3 = up_async(pool, pin, job.iso3, N, stream);
+    fB = up_async(pool, pin, job.fB, 6 * n_nodes, stream);
+    fi3 = up_async(pool, pin, job.fi3, 6 * n_nodes, stream);
+    act = up_async(pool, pin, job.active, N, stream);
     npx = static_cast<float *>(pool.take(N * sizeof(float)));
     npy = static_cast<float *>(pool.take(N * sizeof(float)));
     npz = static_cast<float *>(pool.take(N * sizeof(float)));
@@ -502,19 +591,28 @@ bool backend_force_field(const ForceJob &job) {
 
   static int tpb = best_block_size(force_field_kernel);
   int blocks = (N + tpb - 1) / tpb;
-  force_field_kernel<<<blocks, tpb>>>(rx, ry, rz, px, py, pz, p0, s1, s2, i3,
-                                      act, fB, fi3, N, job.nx, job.ny, job.nz,
-                                      job.periodic, job.ox, job.oy, job.oz,
-                                      job.hx, job.hy, job.hz, job.dt, npx, npy,
-                                      npz);
-  cudaError_t err = cudaDeviceSynchronize();
+  force_field_kernel<<<blocks, tpb, 0, stream>>>(
+      rx, ry, rz, px, py, pz, p0, s1, s2, i3, act, fB, fi3, N, job.nx, job.ny,
+      job.nz, job.periodic, job.ox, job.oy, job.oz, job.hx, job.hy, job.hz,
+      job.dt, npx, npy, npz);
+  cudaError_t err;
+  if (ats) {
+    err = cudaDeviceSynchronize();
+  } else {
+    const size_t b = N * sizeof(float);
+    void *ppx = down_async(pin, npx, b, stream);
+    void *ppy = down_async(pin, npy, b, stream);
+    void *ppz = down_async(pin, npz, b, stream);
+    err = cudaStreamSynchronize(stream);
+    if (err == cudaSuccess) {
+      std::memcpy(job.npx, ppx, b);
+      std::memcpy(job.npy, ppy, b);
+      std::memcpy(job.npz, ppz, b);
+    }
+  }
   bool ok = (err == cudaSuccess);
   if (!ok) {
     printf("[GPU] CUDA field force failed: %s\n", cudaGetErrorString(err));
-  } else if (!ats) {
-    cudaMemcpy(job.npx, npx, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(job.npy, npy, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(job.npz, npz, N * sizeof(float), cudaMemcpyDeviceToHost);
   }
   return ok;
 }
@@ -532,21 +630,30 @@ bool backend_force(const ForceJob &job) {
   const int *act;
   float *npx, *npy, *npz;
   static BufPool pool;
+  static PinPool pin;
+  cudaStream_t stream = ats ? (cudaStream_t)0 : disc_stream();
   if (ats) {
     rx = job.rx; ry = job.ry; rz = job.rz; px = job.px; py = job.py; pz = job.pz;
     p0 = job.p0; m = job.meff; s1 = job.scale1; s2 = job.scale2; i3 = job.iso3;
     jB = job.jB; fi3 = job.fi3; U = job.U; act = job.active;
     npx = job.npx; npy = job.npy; npz = job.npz;
   } else {
-    pool.reset();
-    rx = up(pool, job.rx, N); ry = up(pool, job.ry, N); rz = up(pool, job.rz, N);
-    px = up(pool, job.px, N); py = up(pool, job.py, N); pz = up(pool, job.pz, N);
-    p0 = up(pool, job.p0, N); m = up(pool, job.meff, N);
-    s1 = up(pool, job.scale1, N); s2 = up(pool, job.scale2, N);
-    i3 = up(pool, job.iso3, N); jB = up(pool, job.jB, 4 * n_nodes);
-    fi3 = up(pool, job.fi3, 6 * n_nodes);
-    U = up(pool, job.U, (long)job.n_p * job.n_rho);
-    act = up(pool, job.active, N);
+    pool.reset(); pin.reset();
+    rx = up_async(pool, pin, job.rx, N, stream);
+    ry = up_async(pool, pin, job.ry, N, stream);
+    rz = up_async(pool, pin, job.rz, N, stream);
+    px = up_async(pool, pin, job.px, N, stream);
+    py = up_async(pool, pin, job.py, N, stream);
+    pz = up_async(pool, pin, job.pz, N, stream);
+    p0 = up_async(pool, pin, job.p0, N, stream);
+    m = up_async(pool, pin, job.meff, N, stream);
+    s1 = up_async(pool, pin, job.scale1, N, stream);
+    s2 = up_async(pool, pin, job.scale2, N, stream);
+    i3 = up_async(pool, pin, job.iso3, N, stream);
+    jB = up_async(pool, pin, job.jB, 4 * n_nodes, stream);
+    fi3 = up_async(pool, pin, job.fi3, 6 * n_nodes, stream);
+    U = up_async(pool, pin, job.U, (long)job.n_p * job.n_rho, stream);
+    act = up_async(pool, pin, job.active, N, stream);
     npx = static_cast<float *>(pool.take(N * sizeof(float)));
     npy = static_cast<float *>(pool.take(N * sizeof(float)));
     npz = static_cast<float *>(pool.take(N * sizeof(float)));
@@ -554,19 +661,29 @@ bool backend_force(const ForceJob &job) {
 
   static int tpb = best_block_size(force_kernel);
   int blocks = (N + tpb - 1) / tpb;
-  force_kernel<<<blocks, tpb>>>(rx, ry, rz, px, py, pz, p0, m, s1, s2, i3, act,
-                                jB, fi3, U, N, job.nx, job.ny, job.nz, job.n_p,
-                                job.n_rho, job.niter, job.ox, job.oy, job.oz,
-                                job.hx, job.hy, job.hz, job.inv_dp, job.inv_drho,
-                                job.p_max, job.rho_max, job.dt, npx, npy, npz);
-  cudaError_t err = cudaDeviceSynchronize();
+  force_kernel<<<blocks, tpb, 0, stream>>>(
+      rx, ry, rz, px, py, pz, p0, m, s1, s2, i3, act, jB, fi3, U, N, job.nx,
+      job.ny, job.nz, job.n_p, job.n_rho, job.niter, job.ox, job.oy, job.oz,
+      job.hx, job.hy, job.hz, job.inv_dp, job.inv_drho, job.p_max, job.rho_max,
+      job.dt, npx, npy, npz);
+  cudaError_t err;
+  if (ats) {
+    err = cudaDeviceSynchronize();
+  } else {
+    const size_t b = N * sizeof(float);
+    void *ppx = down_async(pin, npx, b, stream);
+    void *ppy = down_async(pin, npy, b, stream);
+    void *ppz = down_async(pin, npz, b, stream);
+    err = cudaStreamSynchronize(stream);
+    if (err == cudaSuccess) {
+      std::memcpy(job.npx, ppx, b);
+      std::memcpy(job.npy, ppy, b);
+      std::memcpy(job.npz, ppz, b);
+    }
+  }
   bool ok = (err == cudaSuccess);
   if (!ok) {
     printf("[GPU] CUDA force failed: %s\n", cudaGetErrorString(err));
-  } else if (!ats) {
-    cudaMemcpy(job.npx, npx, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(job.npy, npy, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(job.npz, npz, N * sizeof(float), cudaMemcpyDeviceToHost);
   }
   return ok;
 }
