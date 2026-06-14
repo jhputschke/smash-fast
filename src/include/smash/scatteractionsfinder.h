@@ -191,6 +191,18 @@ class ScatterActionsFinder : public ActionFinderInterface {
       const ParticleList &search_list, const Particles &surrounding_list,
       double dt, const std::vector<FourVector> &beam_momentum) const override;
 
+  /**
+   * Cell-list variant of the above: \p surrounding_list is a pre-filtered
+   * candidate list (e.g. the particles in the neighbouring grid cells of the
+   * outgoing particles) rather than the whole ensemble. The per-pair logic and
+   * insertion order are identical to the full-scan overload, so when the
+   * candidate list is a superset of the colliding partners in ensemble order the
+   * resulting actions are bit-identical -- only the O(N) scan is avoided.
+   */
+  ActionList find_actions_with_surrounding_particles(
+      const ParticleList &search_list, const ParticleList &surrounding_list,
+      double dt, const std::vector<FourVector> &beam_momentum) const;
+
   /// No scatterings should be found when the event is over.
   ActionList find_final_actions(const Particles &) const override { return {}; }
 

@@ -2479,6 +2479,32 @@ struct InputKeys {
 
   /*!\Userguide
    * \page doxypage_input_conf_collision_term
+   * \optional_key{key_CT_lazy_propagation_,Lazy_Propagation,bool,false}
+   *
+   * Performance option for the timestepless evolution. When enabled, the
+   * propagation that precedes each collision advances only the particles
+   * involved in (or geometrically near) that collision instead of the whole
+   * ensemble; the remaining particles are propagated once at the end of the
+   * timestep. This is faster on collision-heavy runs.
+   *
+   * \warning The result is **not** bit-identical to the default (eager)
+   * propagation: a particle's position is then advanced in a single step rather
+   * than in many, and floating-point rounding differs, so the microscopic
+   * trajectory diverges (energy and momentum are still conserved to the same
+   * level, and the result is reproducible at a fixed seed and thread count).
+   * The option is only applied when it is sound — no dilepton shining, no
+   * frozen-Fermi beam propagation, and a non-stochastic collision criterion —
+   * and otherwise silently falls back to eager propagation. The
+   * \c SMASH_LAZY_PROP environment variable forces it on regardless of this key.
+   */
+  /**
+   * \see_key{key_CT_lazy_propagation_}
+   */
+  inline static const Key<bool> collTerm_lazyPropagation{
+      InputSections::collisionTerm + "Lazy_Propagation", false, {"3.3"}};
+
+  /*!\Userguide
+   * \page doxypage_input_conf_collision_term
    * \optional_key{key_CT_warn_high_prob_,Only_Warn_For_High_Probability,bool,false}
    *
    * Only warn and not error for reaction probabilities higher than 1.
@@ -6171,6 +6197,7 @@ struct InputKeys {
       std::cref(collTerm_multiParticleReactions),
       std::cref(collTerm_nnbarTreatment),
       std::cref(collTerm_noCollisions),
+      std::cref(collTerm_lazyPropagation),
       std::cref(collTerm_onlyWarnForHighProbability),
       std::cref(collTerm_resonanceLifetimeModifier),
       std::cref(collTerm_spinInteractions),

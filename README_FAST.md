@@ -248,6 +248,39 @@ near 8 threads. Production runs with strings or mean fields skip that check and
 scale further. See [SpeedUp.md](SpeedUp.md#phase-2--openmp-over-ensembles-the-headline)
 for the full Amdahl discussion.
 
+### Collision performing: cell-list re-search (default) + lazy propagation (opt-in)
+
+In a collision-heavy run, the per-timestep *finding* parallelizes (cell-parallel
+for one ensemble, or over ensembles), but *performing* — executing the collisions
+in time order — is serial within an ensemble. Two of its costs are per-collision
+O(N) brute-force scans (the partner re-search after each collision, and advancing
+every particle to each collision time), so performing grows like O(N²) with the
+particle count and dominates large/dense runs. Both are addressed on the CPU:
+
+- **Cell-list partner re-search — on by default, bit-identical.** After a collision
+  the search for new partners of the products scans only the neighbouring grid
+  cells (a spatial hash sized by the bound the finder already uses) instead of the
+  whole ensemble: **O(neighbours) instead of O(N)**. The candidate box is a
+  conservative superset evaluated by the *same* per-pair test, so the result is
+  **bit-identical** to the old full scan (verified on box, collider and string
+  runs). Active for every non-stochastic collision run; no configuration needed.
+- **Lazy propagation — opt-in.** Set `Collision_Term: { Lazy_Propagation: true }`
+  (or the `SMASH_LAZY_PROP` environment variable) to advance only the
+  colliding/candidate particles to each collision time and propagate the rest once
+  at the end of the timestep, removing the other O(N)-per-collision term.
+  > **Not bit-identical.** A particle's position is then advanced in one step
+  > instead of many, so floating-point rounding differs and the microscopic
+  > trajectory diverges — energy/momentum are conserved to the same level and the
+  > result is reproducible at a fixed seed and thread count (the same category as
+  > the GPU FP32 path). Self-gated to the sound cases (no dilepton shining, no
+  > frozen-Fermi propagation, non-stochastic criterion); otherwise it stays eager.
+
+Because both shrink the **serial** performing block, they speed up single-thread
+*and* lift multi-thread scaling, and the gain grows with system size (it targets
+the O(N²) term). On a hot, collision-bound box at 1 thread the cell-list default is
+~**1.25× → 1.83×** over the old scan as test-particles grow 100 → 400, and adding
+`Lazy_Propagation` brings it to ~**1.34× → 1.66×** (100 → 200) on top.
+
 ---
 
 ## Reproducibility & correctness contract
