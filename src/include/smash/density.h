@@ -1062,19 +1062,28 @@ inline bool gather_on_gpu(RectangularLattice<DensityOnLattice> *lat,
     return b < 0 ? 0 : (b >= nbin[a] ? nbin[a] - 1 : b);
   };
   const int n_bins = nbin[0] * nbin[1] * nbin[2];
-  std::vector<int> bin_of(n_src), bin_start(n_bins + 1, 0), bin_part(n_src);
-  for (int i = 0; i < n_src; i++) {
-    const int b = bin_axis(sx[i], 0) +
-                  nbin[0] * (bin_axis(sy[i], 1) + nbin[1] * bin_axis(sz[i], 2));
-    bin_of[i] = b;
-    bin_start[b + 1]++;
-  }
-  for (int b = 0; b < n_bins; b++) {
-    bin_start[b + 1] += bin_start[b];
-  }
-  std::vector<int> cursor(bin_start.begin(), bin_start.end() - 1);
-  for (int i = 0; i < n_src; i++) {
-    bin_part[cursor[bin_of[i]]++] = i;
+  // When the backend builds the cell-list on the device (item 3), skip the host
+  // counting sort entirely and hand the kernel null bin arrays — it rebuilds an
+  // identical cell-list from the positions. Otherwise build it here.
+  const bool device_cell_list = gpu::gather_builds_cell_list();
+  std::vector<int> bin_start, bin_part;
+  if (!device_cell_list) {
+    std::vector<int> bin_of(n_src);
+    bin_start.assign(n_bins + 1, 0);
+    bin_part.resize(n_src);
+    for (int i = 0; i < n_src; i++) {
+      const int b = bin_axis(sx[i], 0) +
+                    nbin[0] * (bin_axis(sy[i], 1) + nbin[1] * bin_axis(sz[i], 2));
+      bin_of[i] = b;
+      bin_start[b + 1]++;
+    }
+    for (int b = 0; b < n_bins; b++) {
+      bin_start[b + 1] += bin_start[b];
+    }
+    std::vector<int> cursor(bin_start.begin(), bin_start.end() - 1);
+    for (int i = 0; i < n_src; i++) {
+      bin_part[cursor[bin_of[i]]++] = i;
+    }
   }
 
   // Occupied node box [gl, gu). Periodic: every node can receive a contribution
@@ -1116,7 +1125,8 @@ inline bool gather_on_gpu(RectangularLattice<DensityOnLattice> *lat,
   job.p0 = p0.data(); job.px = px.data(); job.py = py.data(); job.pz = pz.data();
   job.dfac = dfac.data();
   job.nbx = nbin[0]; job.nby = nbin[1]; job.nbz = nbin[2];
-  job.bin_start = bin_start.data(); job.bin_part = bin_part.data();
+  job.bin_start = device_cell_list ? nullptr : bin_start.data();
+  job.bin_part = device_cell_list ? nullptr : bin_part.data();
   job.nx = n_cells[0]; job.ny = n_cells[1]; job.nz = n_cells[2];
   job.ox = static_cast<float>(origin[0]);
   job.oy = static_cast<float>(origin[1]);

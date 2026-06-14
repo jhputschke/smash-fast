@@ -30,6 +30,12 @@
 // summaries cross the bus) is the further step tracked in PotentialNextSteps §3c.
 
 #include <cuda_runtime.h>
+#include <thrust/binary_search.h>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/sequence.h>
+#include <thrust/sort.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -160,6 +166,41 @@ __global__ void gather24(const float *__restrict__ sx,
   // zero and `out` is pre-zeroed (host vector / cudaMemsetAsync), so the gradient
   // slots stay 0 exactly as before — bit-identical to the old runtime-flag path.
   for (int c = 0; c < NACC; c++) out[node_i * 24 + c] = (float)acc[c];
+}
+
+// On-device cell-list build (item 3): one thread per source particle computes its
+// flat bin index, reproducing the host bin_axis() in density.h *exactly* (open:
+// edge=rcut, clamped; periodic: even tiling of L=n*h, wrapped). The bin index is
+// then the key for a thrust::stable_sort_by_key over the particle indices, whose
+// ascending-index-within-bin order matches the host stable counting sort — so the
+// resulting bin_part/bin_start are identical to the host cell-list and the gather
+// output is bit-for-bit unchanged. Computed in double (matching the host, which
+// bins from the double origin / L) so boundary assignment cannot differ.
+__global__ void cell_bin_of(const float *__restrict__ sx,
+                            const float *__restrict__ sy,
+                            const float *__restrict__ sz, int n_src, int nbx,
+                            int nby, int nbz, double ox, double oy, double oz,
+                            int nx, int ny, int nz, double hx, double hy,
+                            double hz, double rcut, int periodic,
+                            int *__restrict__ bin_of) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_src) return;
+  const double L[3] = {nx * hx, ny * hy, nz * hz};
+  const double o[3] = {ox, oy, oz};
+  const int nb[3] = {nbx, nby, nbz};
+  const float v[3] = {sx[i], sy[i], sz[i]};
+  int b3[3];
+  for (int a = 0; a < 3; a++) {
+    if (periodic) {
+      int b = (int)floor((v[a] - o[a]) * nb[a] / L[a]);
+      b %= nb[a];
+      b3[a] = b < 0 ? b + nb[a] : b;
+    } else {
+      int b = (int)floor((v[a] - o[a]) / rcut);
+      b3[a] = b < 0 ? 0 : (b >= nb[a] ? nb[a] - 1 : b);
+    }
+  }
+  bin_of[i] = b3[0] + nbx * (b3[1] + nby * b3[2]);
 }
 
 // ---- momentum-dependent force / root-find (device update_momenta) -----------
@@ -363,6 +404,24 @@ bool use_fp64_acc() {
   return cached == 1;
 }
 
+// Whether to build the gather's cell-list on the device (item 3): a counting sort
+// (cell_bin_of -> thrust::stable_sort_by_key -> lower_bound CSR) replaces the host
+// build. Opt-in via SMASH_GPU_CELLLIST=1; default off so the production path is
+// unchanged. Output is identical to the host cell-list (see cell_bin_of), so it is
+// safe to enable. On a discrete card it additionally removes the bin_start/bin_part
+// H2D; on GB10 it lifts the host counting sort off the CPU critical path.
+bool use_device_cell_list() {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *e = std::getenv("SMASH_GPU_CELLLIST");
+    cached = (e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0 ||
+                    std::strcmp(e, "true") == 0))
+                 ? 1
+                 : 0;
+  }
+  return cached == 1;
+}
+
 // One grow-only device allocation, reused across calls (no per-call malloc/free).
 struct DevBuf {
   void *d = nullptr;
@@ -463,6 +522,38 @@ inline void *down_async(PinPool &hp, void *src, size_t bytes, cudaStream_t s) {
   return pin;
 }
 
+// Build the cell-list on the device from the (device or zero-copy host) positions
+// dsx/dsy/dsz: counting sort via cell_bin_of -> stable_sort_by_key -> lower_bound
+// CSR. Writes bin_start[n_bins+1] and bin_part[n_src] into device buffers taken
+// from `dp`, and returns them. Bit-identical to the host cell-list (item 3).
+void build_cell_list_device(BufPool &dp, const smash::gpu::GatherJob &job,
+                            const float *dsx, const float *dsy, const float *dsz,
+                            int n_bins, cudaStream_t s, int **bin_start,
+                            int **bin_part) {
+  const int n = job.n_src;
+  int *d_binof = static_cast<int *>(dp.take((size_t)n * sizeof(int)));
+  int *d_part = static_cast<int *>(dp.take((size_t)n * sizeof(int)));
+  int *d_start = static_cast<int *>(dp.take((size_t)(n_bins + 1) * sizeof(int)));
+
+  int tpb = 256, blocks = (n + tpb - 1) / tpb;
+  cell_bin_of<<<blocks, tpb, 0, s>>>(
+      dsx, dsy, dsz, n, job.nbx, job.nby, job.nbz, job.ox, job.oy, job.oz,
+      job.nx, job.ny, job.nz, job.hx, job.hy, job.hz, job.rcut, job.periodic,
+      d_binof);
+
+  auto pol = thrust::cuda::par.on(s);
+  thrust::device_ptr<int> binof(d_binof), part(d_part), start(d_start);
+  thrust::sequence(pol, part, part + n, 0);
+  // Stable sort keeps ascending particle index within each bin == host order.
+  thrust::stable_sort_by_key(pol, binof, binof + n, part);
+  // CSR offsets: bin_start[b] = #particles in bins < b = lower_bound(sorted, b).
+  thrust::counting_iterator<int> bins(0);
+  thrust::lower_bound(pol, binof, binof + n, bins, bins + n_bins + 1, start);
+
+  *bin_start = d_start;
+  *bin_part = d_part;
+}
+
 // Block size that maximises theoretical occupancy for the given kernel on the
 // active device, accounting for its register/shared-memory use (so the heavier
 // FP64-accumulator gather is sized differently from the lighter force kernels,
@@ -492,6 +583,8 @@ bool backend_available() {
 
 const char *backend_name() { return "cuda"; }
 
+bool backend_gather_builds_cell_list() { return use_device_cell_list(); }
+
 bool backend_gather(const GatherJob &job) {
   std::lock_guard<std::mutex> lk(g_mutex);
   const long n_nodes = (long)job.nx * job.ny * job.nz;
@@ -507,6 +600,8 @@ bool backend_gather(const GatherJob &job) {
   float *out;
   static BufPool pool;
   static PinPool pin;
+  static BufPool clpool;  // cell-list device buffers (item 3)
+  const bool dcl = use_device_cell_list();
   cudaStream_t stream = ats ? (cudaStream_t)0 : disc_stream();
   if (ats) {
     sx = job.sx; sy = job.sy; sz = job.sz; p0 = job.p0;
@@ -523,10 +618,30 @@ bool backend_gather(const GatherJob &job) {
     py = up_async(pool, pin, job.py, job.n_src, stream);
     pz = up_async(pool, pin, job.pz, job.n_src, stream);
     df = up_async(pool, pin, job.dfac, job.n_src, stream);
-    bs = up_async(pool, pin, job.bin_start, n_bins + 1, stream);
-    bp = up_async(pool, pin, job.bin_part, job.n_src, stream);
+    // Discrete + device cell-list: build the bins on the device from the uploaded
+    // positions instead of copying the host cell-list across the bus.
+    if (!dcl) {
+      bs = up_async(pool, pin, job.bin_start, n_bins + 1, stream);
+      bp = up_async(pool, pin, job.bin_part, job.n_src, stream);
+    } else {
+      bs = bp = nullptr;
+    }
     out = static_cast<float *>(pool.take(24 * n_nodes * sizeof(float)));
     cudaMemsetAsync(out, 0, 24 * n_nodes * sizeof(float), stream);
+  }
+
+  // On-device cell-list (item 3): replace the host bin_start/bin_part with a
+  // device counting sort over the same positions. Bit-identical to the host
+  // cell-list (cell_bin_of mirrors bin_axis; the stable sort mirrors the host
+  // intra-bin index order). Works on both transports (ATS reads the zero-copy
+  // host positions, discrete the uploaded ones).
+  if (dcl) {
+    clpool.reset();
+    int *cl_start = nullptr, *cl_part = nullptr;
+    build_cell_list_device(clpool, job, sx, sy, sz, n_bins, stream, &cl_start,
+                           &cl_part);
+    bs = cl_start;
+    bp = cl_part;
   }
 
   // Dispatch one of the four (Acc x WantGrad) instantiations; each caches its own

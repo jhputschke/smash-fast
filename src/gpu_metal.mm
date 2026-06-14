@@ -438,6 +438,9 @@ bool backend_available() {
 
 const char *backend_name() { return "metal"; }
 
+// The Metal backend builds the cell-list on the host (item 3 is CUDA-only).
+bool backend_gather_builds_cell_list() { return false; }
+
 bool backend_gather(const GatherJob &job) {
   ensure_init();
   if (!g_ok) {

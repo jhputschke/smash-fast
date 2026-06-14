@@ -146,3 +146,74 @@ is rated *Low* for GB10, *Med* for discrete in
 [CudaNextSteps.md](CudaNextSteps.md#L203)). The benefit is realized on an
 occupancy-bound discrete HBM card running a large no-gradient gather, and it makes
 the FP64 path (92→59 regs) materially more affordable — ready to measure there.
+
+---
+
+## Step 3 — Items 1+3: on-device cell-list build (the resident-fusion enabler)
+
+This step is the headline "lattice-resident fusion + on-device cell-list" group.
+It lands **item 3 in full** — the on-device cell-list, which
+[CudaNextSteps.md](CudaNextSteps.md#L148) calls *"the enabler that lets item 1 keep
+the entire step on-device"* — validated bit-identical and measured. The remaining
+piece of **item 1** (porting the inter-kernel CPU stages so the density/field
+lattice never returns to the host) is scoped at the end as staged production work,
+since it is an all-or-nothing multi-file refactor (the lattice is consumed by the
+host field-derivation/output, so a partial port does not remove the round-trip).
+
+**What changed.**
+- [src/gpu_cuda.cu](src/gpu_cuda.cu): `cell_bin_of` (one thread/particle, computes
+  the flat bin index in **double**, mirroring `density.h`'s `bin_axis` for both the
+  open `edge=rcut` and periodic `even-tiling` cases) → `thrust::stable_sort_by_key`
+  over particle indices → `thrust::lower_bound` for the CSR `bin_start`. The stable
+  sort's ascending-index-within-bin order is exactly the host counting sort's, so
+  `bin_part`/`bin_start` come out **identical to the host cell-list**. Gated by
+  `use_device_cell_list()` (`SMASH_GPU_CELLLIST=1`, default off).
+- Interface: `gpu::gather_builds_cell_list()` ([gpu_backend.h](src/include/smash/gpu_backend.h),
+  wired through [gpu_backend.cc](src/gpu_backend.cc) + the cuda/metal/none detail
+  fns). When true, [density.h](src/include/smash/density.h) **skips the host
+  counting sort** and hands the kernel null bin arrays; the backend rebuilds them
+  on the device. The discrete path additionally skips the `bin_start`/`bin_part`
+  H2D.
+
+**Why it is safe (precision).** Bins identical ⇒ gather inputs identical ⇒
+bit-for-bit identical output. Proven two ways: collisionless drift vs the locked
+reference is **0.000e+00** for both `box` (periodic) and `md` (open) on both
+transports, **and** the *chaotic collision* `potentials_md` md5 with the cell-list
+on equals the cell-list-off md5 (`f71f414c…`) — identical even through the
+collision butterfly, which only bit-identity can achieve.
+
+**Speed-up (GB10).** Min/typical of repeated `T=1` collisionless runs:
+
+| config | particles | cell-list OFF | cell-list ON | speed-up |
+|---|---|---|---|---|
+| box  | 32000 | ~4.2 s | ~3.25 s | **~1.23×** |
+| md   | 1280  | 7.38 s | 7.37 s | ~1.0× (build negligible) |
+
+The win scales with particle count: the host counting sort is an O(N) **serial**
+(non-OpenMP) loop with a random-access scatter and per-call vector allocations,
+and on the ATS path the host-built `bin_part` is also read by the gather over the
+coherent link; moving the build to the GPU removes the serial host work and makes
+the gather read `bin_part` from device memory. For the 32000-particle box this is
+~23% of the `T=1` step — above the doc's *Med* estimate. On a discrete card it
+*also* removes the `bin_start`/`bin_part` H2D each gather.
+
+**Why opt-in (not yet default).** `cell_bin_of` bins from the float-cast
+`GatherJob` origin/`rcut`/cell-size, whereas the host bins from the original
+double values. For every config tested (round box bounds *and* the collider's
+non-round `rcut`) the assignment is bit-identical, but a particle landing exactly
+on a bin boundary could in principle flip. Flipping it to default-on wants the
+exact double binning params threaded into `GatherJob` (a small follow-up); until
+then it is a validated, measured, opt-in win, ready to enable and to test on a
+discrete card.
+
+**Item 1 (full lattice residency) — staged, not yet landed.** Keeping the
+gather→four-gradient→ρ-gradient→FB/FI3-field→force chain entirely on-device
+(`PotentialNextSteps §3c`) is the remaining big lever. It is all-or-nothing: the
+24-float/node lattice is consumed on the host by the field derivation and output,
+so until *every* inter-kernel stage (the `compute_four_gradient_lattice` stencil,
+the node-local `drho_dxnu`, and the Skyrme/VDF + symmetry force-field derivation)
+is ported to CUDA and threaded through a step-scoped device context (which also
+subsumes **item 5**, the single shared particle-SoA marshal), the lattice still
+round-trips and there is no win. The pieces are individually node-local/stencil
+kernels gateable on the collisionless drift harness built here; this is the
+documented production §3c effort and is left staged rather than landed half-fused.
