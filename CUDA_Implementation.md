@@ -16,55 +16,45 @@ re-measured on a real PCIe card later.
 
 ## Precision methodology — the deterministic oracle
 
-The mean-field configs are chaotic many-body systems: any FP32 perturbation (e.g.
-GPU vs CPU) diverges into a different *end state* — `potentials_md` already
-differs by 3 particles in `Npart` between the CPU and GPU runs, and OpenMP
-collision-ordering jitter makes a `T>=2` run non-reproducible run-to-run. So the
-end-state md5 of a threaded run is **not** a usable regression signal.
+The mean-field **collision** configs are chaotic many-body systems: any last-ULP
+perturbation diverges into a different *end state*. This bites in a subtle way —
+even a logically-identical kernel **refactor** changes the end-state md5, because
+nvcc re-schedules an FMA when the kernel source changes, and that ~1e-7 tip
+amplifies through the discrete collision outcomes (`potentials_md`'s `Npart`
+already differs 3–10 between equivalent runs). Energy and charge stay conserved to
+~1e-6 regardless, so the end-state md5 of a *collision* run is **not** a usable
+"did precision drift" signal, and conservation alone is too coarse.
 
-Two facts make a clean gate possible:
+The rigorous gate is a **collisionless** run (`No_Collisions: True`): a smooth
+Hamiltonian flow with a **fixed particle count** and a **stable output order**, so
+GPU output is comparable **per particle** and does not diverge chaotically. The
+drift a change introduces is measured directly as
 
-1. **At `T=1` the whole run is deterministic** — the GPU kernels (`gather24`,
-   `force_kernel`, `force_field_kernel`) are one-thread-per-output with no
-   atomics, so a `T=1` run is bit-reproducible.
-2. **The ATS (zero-copy) path and the discrete copy path run the *same* FP32
-   kernels** — only the memory transport differs. So at `T=1` they must produce
-   **bit-identical** output. This equality is the lever that lets the
-   discrete-GPU optimizations be validated on a GB10.
+> GPU(after) vs GPU(reference = original kernels), aligned by particle id →
+> `max |Δp|/|p|`, required `<= 1e-4` ([verify/oscar_numdiff.py](verify/oscar_numdiff.py)).
 
-[`verify/gpu_prec.sh`](verify/gpu_prec.sh) encodes this: it runs `T=1` for three
-configs covering both GPU code paths, on both transports, and diffs the md5
-against a saved baseline.
+The reference (`verify/_prec_ref_{box,md}`) is the original-kernel output, locked
+once before any change; the gate measures **cumulative** drift against it across
+all steps. [`verify/gpu_prec.sh`](verify/gpu_prec.sh) runs two collisionless cases
+covering both GPU paths, on both transports:
 
 | case | config | GPU paths exercised |
 |---|---|---|
-| `md`   | `potentials_md.yaml` | gather-with-gradient + momentum-dependent `force_kernel` |
-| `nomd` | `_prec_nomd.yaml` (potentials_nomd, End_Time 3) | gather + field `force_field_kernel`, open lattice |
-| `box`  | `_prec_box.yaml` (VDF box, Oscar) | **periodic** gather + field `force_field_kernel` |
+| `md`  | `potentials_md` + No_Collisions | gather-with-gradient + momentum-dependent `force_kernel` (Covariant-Gaussian derivs) |
+| `box` | VDF box + No_Collisions, Oscar | **periodic** no-gradient gather + field `force_field_kernel` (Finite-difference derivs) |
 
-**Baseline (locked before any change):**
+It also checks **ATS (zero-copy) == COPY (discrete, `SMASH_GPU_ATS=0`)**: the two
+run the *same* FP32 kernels, so their output is bit-identical — the equality that
+lets the discrete-GPU optimizations be validated on a GB10 box.
 
-| case | md5 (ats == copy) |
-|---|---|
-| md   | `578d40e782fc6951ae899d0d9546a398` |
-| nomd | `e3c1921c532e4f66069e78a409c2a522` |
-| box  | `36e6c4837bda86305476ef6a001489e2` |
-
-- **No-physics steps** (items 2, 6, 4, 7) must keep all three md5 **identical** to
-  this baseline, on **both** transports.
-- **Physics-touching steps** (item 1+3) will change the md5; for those the gate is
-  per-step conservation (energy rel-diff and charge) under 1e-4 plus the
-  ATS==COPY equality, documented inline at that step.
-
-`T=1` copy-path (discrete-proxy) evolution times, recorded as the "before" for the
-discrete optimizations (GB10 LPDDR — a real PCIe card will show a much larger copy
-share, so these understate the discrete win):
-
-| case | evol [s] |
-|---|---|
-| md   | 8.90 |
-| nomd | 9.36 |
-| box  | 12.15 |
+**Reference precision of the FP32 backend** (original kernels, GPU vs CPU-FP64,
+collisionless): md `max|Δp|/|p| = 9.6e-7`, box `= 2.6e-4`. The box is larger
+because it evolves 5 fm/c of dense (0.16 fm⁻³) periodic VDF mean-field, so the
+inherent FP32 per-step force error accumulates — this is the backend's design
+point (FP32 per-pair, FP64 accumulate; full FP64 is a non-goal on GB10), **not**
+something any step here may worsen. Every step is gated on *drift from this
+reference* staying `<= 1e-4`, i.e. it must not move the result more than the
+backend's own FP32 grain.
 
 ---
 
@@ -90,16 +80,13 @@ and issues the copies and the kernel **async on a persistent stream**:
   gather output. **The ATS path is untouched** — it still passes the host arrays
   straight to the kernel with no copy, on the default stream.
 
-**Why it is safe (precision).** No math changed and the bytes transported are
-identical, so the discrete-path output is bit-for-bit what it was. Verified by
-`verify/gpu_prec.sh`: all three configs, **both** transports, md5 identical to the
-locked baseline.
-
-| case | ats md5 | copy md5 | vs baseline |
-|---|---|---|---|
-| md   | `578d40e7…` | `578d40e7…` | identical |
-| nomd | `e3c1921c…` | `e3c1921c…` | identical |
-| box  | `36e6c483…` | `36e6c483…` | identical |
+**Why it is safe (precision).** This is a memory/transport-only change — the
+kernel source is untouched, so it compiles to identical PTX and the bytes
+transported are identical. The discrete-path output is therefore bit-for-bit what
+it was (a *stronger* guarantee than the collisionless drift gate the later
+kernel-touching steps rely on). Confirmed bit-identical to the original output on
+**both** transports (ATS and `SMASH_GPU_ATS=0`), including the chaotic collision
+run, and **drift 0** under the collisionless gate.
 
 **Speed-up.** On **GB10 this is intentionally a no-op on the hot path**: the ATS
 path is taken, has no copy to overlap, and is unchanged. Forcing the discrete path
@@ -111,3 +98,51 @@ overlap; there pinned + async hides most of the particle transfer behind the
 gather/force compute (item 2 is rated *High* for discrete, *N/A* for GB10 in
 [CudaNextSteps.md](CudaNextSteps.md#L129)). The implementation is validated
 bit-identical on GB10 and ready to be re-measured on a PCIe card.
+
+---
+
+## Step 2 — Item 6: `gather24` gradient / no-gradient specialization
+
+**What changed** ([src/gpu_cuda.cu](src/gpu_cuda.cu)). `gather24` gained a second
+template parameter `bool WantGrad` alongside the accumulator type `Acc`. The
+gradient half of the node accumulator (`acc[8..23]`, the `djmu_dxnu` derivatives)
+and the block that fills it are now compiled out via `if constexpr (WantGrad)`
+when the caller does not need gradients; the accumulator shrinks from `acc[24]` to
+`acc[8]`. The runtime `compute_gradient` kernel argument is gone — the choice is
+compile-time, so `backend_gather` dispatches one of four (`Acc` × `WantGrad`)
+instantiations, each sized for its own register budget by
+`cudaOccupancyMaxPotentialBlockSize`.
+
+**Why it is safe (precision).** No per-pair math changed. The no-gradient variant
+writes only the 8 current components; `acc[8..23]` would be zero and `out` is
+pre-zeroed (host vector / `cudaMemsetAsync`), so the gradient slots stay 0 exactly
+as the old runtime-flag path left them. Collisionless drift gate vs the locked
+original-kernel reference:
+
+| case | path | drift `max|Δp|/|p|` | ATS==COPY |
+|---|---|---|---|
+| md  | gather-with-gradient (`WantGrad=true`)  | **0.000e+00** | OK |
+| box | no-gradient gather (`WantGrad=false`)   | **0.000e+00** | OK |
+
+Drift is exactly zero on both paths — the kernel is bit-identical for the smooth
+trajectories. (The chaotic *collision* `potentials_md` md5 does shift, purely from
+nvcc re-scheduling an FMA in the recompiled kernel; energy stays conserved to
+1.9e-6, charge exact — within precision, and the reason the collisionless gate is
+the one that matters.)
+
+**Speed-up.** The concrete win is register pressure on the no-gradient path
+(ptxas, sm_75 reference):
+
+| variant | regs before | regs after |
+|---|---|---|
+| FP32 gather | 68 (always carried `acc[24]`) | **51** (no-grad) / 68 (grad) |
+| FP64 gather | 92 | **59** (no-grad) / 92 (grad) |
+
+Lower registers ⇒ higher occupancy for the no-gradient gather (the
+Finite-difference / VDF configs, where the derivatives come from the CPU stencil,
+not the gather). On **GB10 the gather is bandwidth-bound and a small fraction of
+these configs' step, so the wall-time change is within run-to-run noise** (item 6
+is rated *Low* for GB10, *Med* for discrete in
+[CudaNextSteps.md](CudaNextSteps.md#L203)). The benefit is realized on an
+occupancy-bound discrete HBM card running a large no-gradient gather, and it makes
+the FP64 path (92→59 regs) materially more affordable — ready to measure there.

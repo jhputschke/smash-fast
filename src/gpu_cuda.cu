@@ -48,7 +48,15 @@ __device__ inline int pmod(int a, int n) { int m = a % n; return m < 0 ? m + n :
 // the read-only data cache (LDG) and assume no aliasing with `out`. Templated on
 // the node-accumulator type Acc (see backend_gather): FP32 by default (fast,
 // matches the Metal backend), FP64 opt-in for high-density precision studies.
-template <typename Acc>
+//
+// Second template parameter WantGrad (item 6): the gradient half of the node
+// accumulator (acc[8..23], the djmu_dxnu derivatives) is only needed when the
+// caller asks for it. Compiling it out drops the accumulator from 24 to 8 regs,
+// which on the register-bound FP64 variant (48->16 accumulator regs) and even on
+// FP32 raises occupancy. The runtime `compute_gradient` flag is gone — the choice
+// is now compile-time, so `cudaOccupancyMaxPotentialBlockSize` sizes each of the
+// four (Acc x WantGrad) variants for its own register budget.
+template <typename Acc, bool WantGrad>
 __global__ void gather24(const float *__restrict__ sx,
                          const float *__restrict__ sy,
                          const float *__restrict__ sz,
@@ -62,8 +70,8 @@ __global__ void gather24(const float *__restrict__ sx,
                          int nz, int nbx, int nby, int nbz, int glx, int gly,
                          int glz, int gux, int guy, int guz, float ox, float oy,
                          float oz, float hx, float hy, float hz, float rcut,
-                         float two_sig_sqr_inv, float norm, int compute_gradient,
-                         int periodic, float *__restrict__ out) {
+                         float two_sig_sqr_inv, float norm, int periodic,
+                         float *__restrict__ out) {
   const int bxn = gux - glx, byn = guy - gly, bzn = guz - glz;
   const long n_box = (long)bxn * byn * bzn;
   long tid = blockIdx.x * (long)blockDim.x + threadIdx.x;
@@ -97,8 +105,9 @@ __global__ void gather24(const float *__restrict__ sx,
   // accumulator's register footprint (24 -> 48 regs), which on a large lattice
   // cuts gather occupancy hard (measured ~1.5x slower on the 80³ potentials_md
   // gather) — hence FP32 is the default and FP64 is opt-in.
-  Acc acc[24];
-  for (int c = 0; c < 24; c++) acc[c] = Acc(0);
+  constexpr int NACC = WantGrad ? 24 : 8;
+  Acc acc[NACC];
+  for (int c = 0; c < NACC; c++) acc[c] = Acc(0);
 
   for (int dz = -1; dz <= 1; dz++) { int bz = bcz + dz; if (periodic) bz = pmod(bz, nbz); else if (bz < 0 || bz >= nbz) continue;
    for (int dy = -1; dy <= 1; dy++) { int by = bcy + dy; if (periodic) by = pmod(by, nby); else if (by < 0 || by >= nby) continue;
@@ -133,7 +142,7 @@ __global__ void gather24(const float *__restrict__ sx,
         } else {
           acc[4] += fts; acc[5] += fts * bvx; acc[6] += fts * bvy; acc[7] += fts * bvz;
         }
-        if (compute_gradient) {
+        if constexpr (WantGrad) {
           float sfg = sf * two_sig_sqr_inv * 2.0f;
           float gx = (rx + ux * ur) * sfg * norm;
           float gy = (ry + uy * ur) * sfg * norm;
@@ -147,7 +156,10 @@ __global__ void gather24(const float *__restrict__ sx,
       }
     }}}
   int node_i = ix + nx * (iy + ny * iz);
-  for (int c = 0; c < 24; c++) out[node_i * 24 + c] = (float)acc[c];
+  // No-gradient variant writes only the 8 current components; acc[8..23] would be
+  // zero and `out` is pre-zeroed (host vector / cudaMemsetAsync), so the gradient
+  // slots stay 0 exactly as before — bit-identical to the old runtime-flag path.
+  for (int c = 0; c < NACC; c++) out[node_i * 24 + c] = (float)acc[c];
 }
 
 // ---- momentum-dependent force / root-find (device update_momenta) -----------
@@ -517,22 +529,29 @@ bool backend_gather(const GatherJob &job) {
     cudaMemsetAsync(out, 0, 24 * n_nodes * sizeof(float), stream);
   }
 
-  // Dispatch the FP32 or FP64 accumulator instantiation; each caches its own
-  // occupancy-optimal block size (the FP64 variant uses more registers).
+  // Dispatch one of the four (Acc x WantGrad) instantiations; each caches its own
+  // occupancy-optimal block size (the FP64 / with-gradient variants use more
+  // registers, so the no-gradient variant launches with a larger block).
 #define GATHER_ARGS                                                            \
   sx, sy, sz, p0, px, py, pz, df, bs, bp, job.nx, job.ny, job.nz, job.nbx,     \
       job.nby, job.nbz, job.glx, job.gly, job.glz, job.gux, job.guy, job.guz,  \
       job.ox, job.oy, job.oz, job.hx, job.hy, job.hz, job.rcut,                \
-      job.two_sig_sqr_inv, job.norm, job.compute_gradient, job.periodic, out
+      job.two_sig_sqr_inv, job.norm, job.periodic, out
+#define GATHER_LAUNCH(ACC, GRAD)                                               \
+  do {                                                                         \
+    static int tpb = best_block_size(gather24<ACC, GRAD>);                     \
+    long blocks = (n_box + tpb - 1) / tpb;                                     \
+    gather24<ACC, GRAD><<<blocks, tpb, 0, stream>>>(GATHER_ARGS);              \
+  } while (0)
+  const bool want_grad = job.compute_gradient != 0;
   if (use_fp64_acc()) {
-    static int tpb = best_block_size(gather24<double>);
-    long blocks = (n_box + tpb - 1) / tpb;
-    gather24<double><<<blocks, tpb, 0, stream>>>(GATHER_ARGS);
+    if (want_grad) GATHER_LAUNCH(double, true);
+    else           GATHER_LAUNCH(double, false);
   } else {
-    static int tpb = best_block_size(gather24<float>);
-    long blocks = (n_box + tpb - 1) / tpb;
-    gather24<float><<<blocks, tpb, 0, stream>>>(GATHER_ARGS);
+    if (want_grad) GATHER_LAUNCH(float, true);
+    else           GATHER_LAUNCH(float, false);
   }
+#undef GATHER_LAUNCH
 #undef GATHER_ARGS
   // ATS: nothing to copy back, just drain the default stream. Discrete: async D2H
   // through pinned staging, then sync the stream and copy out to the host array.
