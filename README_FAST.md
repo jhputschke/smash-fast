@@ -310,25 +310,33 @@ for ensembles) whenever collisions are a real fraction of the runtime.
 
 **Worked example — `verify/config_box_VDF.yaml`.** This box runs at
 `Temperature: 0.1` GeV with 2→2 collisions on, so over 10 fm it fires
-**13 353 collisions** (`Interactions: Pauli‑blocked/performed = 168/13353`). Both
-phases are exercised, and the run **barely scales** with threads (best‑of‑2 `Time
-real`, M3 Max, CPU, `End_Time=10`):
+**13 353 collisions** (`Interactions: Pauli‑blocked/performed = 168/13353`), and it
+**barely scales** with threads. The cleanest way to see why is to write the hot run
+as *cold box + collisions* (best‑of‑2 `Time real`, M3 Max, CPU, `End_Time=10`):
 
-| threads | full run (CPU) | scaling |
-|---|---|---|
-| 1  | 34.5 s | — |
-| 8  | 19.4 s | 1.77× |
-| 16 | 18.5 s | 1.87× |
+| component | 1t | 8t | 16t |
+|---|---|---|---|
+| **Cold box** — finding + mean‑field, 0 collisions (drop `Temperature` to 0.001) | 23.4 s | 9.2 s | 8.1 s |
+| **+ collisions** — the serial *performing* | +11.1 s | +10.2 s | +10.4 s |
+| **= Hot box** (`T=0.1`) | **34.5 s** | **19.4 s** | **18.5 s** |
+| whole‑run speedup | 1× | 1.78× | 1.87× |
 
-The reason is the finding/performing split. *Finding* is cell‑parallel and would
-scale ~4× on its own (the **cold** limit of this same box — drop the temperature
-so 0 collisions fire — does exactly that: 20.0 s → 4.9 s, 1→16t). But *performing*
-the 13 353 collisions is **serial** (`Ensembles: 1`, time‑ordered, each action
-mutating the list) and becomes the dominant term past a few threads — a textbook
-Amdahl wall. The mean‑field is a separate ~3.7 s floor (which the GPU cuts to ~2 s,
-above). **The lever is `Ensembles`:** splitting the box into N ensembles
-parallelizes *performing* too — the headline 5.5–6.5× (8t) path — whereas more
-threads on one ensemble cannot.
+The cold box is **finding‑dominated and parallel** — it scales **2.9×** on its own
+(finding is cell‑parallel; the mean‑field is a small ~3.7 s floor the GPU cuts to
+~2 s, above). Turning on collisions bolts on a **~11 s block that is flat across
+thread counts** — that is *performing*, which is **serial** within an ensemble
+(`Ensembles: 1`, actions executed in time order, each mutating the list). Finding
+still scales exactly as before; the flat serial block is just Amdahl's non‑parallel
+fraction, and it drags the whole‑run speedup from 2.9× to 1.87×.
+
+This dissolves an apparent paradox — finding is the *largest* slice at 1 thread, yet
+the run scales badly. Both are true: finding's share *shrinks* as threads are added
+while performing's block stays put, so by 16 threads the serial performing is the
+biggest single term. **The lever is `Ensembles`:** splitting the box into N
+ensembles parallelizes *performing* too — the headline 5.5–6.5× (8t) path — whereas
+more threads on one ensemble cannot. (Profiling shows performing's cost is almost
+entirely the per‑collision re‑propagation and the O(N) partner re‑search, not the
+collision physics, which is negligible.)
 
 Note that **Pauli blocking is *not* the wall**, even though it lives in that serial
 phase: it costs only ~0.3–0.8 s here. It runs only on performed actions, as an O(N)
