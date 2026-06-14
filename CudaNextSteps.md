@@ -31,13 +31,17 @@ to-do):
 - **Persistent grow-only device buffers** (`BufPool`) for the discrete path — kills
   the per-call `cudaMalloc`/`cudaFree` churn; the copy remains (a discrete card needs
   it) but the allocation does not.
-- **FP64 gather accumulator** — `gather24` accumulates each node in `double` (per-pair
-  math stays FP32); removes the √N·ε density-dependent drift (the §3a precision rule).
+- **FP32 gather accumulator by default, FP64 opt-in** — `gather24` is templated on the
+  node-accumulator type; the default FP32 matches the Metal backend and is CPU-equivalent
+  at SIS density (`potentials_md`: E_tot rel 4e-8, Npart/Q exact). `SMASH_GPU_FP64_ACC=1`
+  switches to `double` for the §3a √N·ε high-density precision study, at ~1.5× gather time
+  (the wider accumulator halves occupancy — see item 6). FP64-as-default was measured to
+  cost +54% on the 80³ `potentials_md` gather, hence opt-in.
 - **`const __restrict__`** on all read-only kernel/helper pointers — routes the
   scattered per-pair gathers through the read-only data cache (LDG), no-alias scheduling.
 - **Occupancy-based launch** — `cudaOccupancyMaxPotentialBlockSize` per kernel replaces
-  the blind `tpb=128` (register-aware; matters because `gather24` uses **91 regs**,
-  `force_kernel` 57, `force_field_kernel` 35 — all **0 spills**).
+  the blind `tpb=128` (register-aware; matters most for the FP64 `gather24` variant at
+  **91 regs**; `force_kernel` 57, `force_field_kernel` 35 — all **0 spills**).
 
 ---
 
@@ -198,14 +202,16 @@ with item 1, which already needs such a context.
 
 ## 6. `gather24` gradient / no-gradient specialization
 
-**What.** `gather24` always carries `double acc[24]` (= 48 registers of accumulator)
-even when `compute_gradient == 0`, where only `acc[0..7]` are used. Compile two
-specializations (or template on a `bool`) so the no-gradient path carries `acc[8]`.
+**What.** `gather24` always carries `acc[24]` even when `compute_gradient == 0`, where
+only `acc[0..7]` are used. Compile two specializations (or template on a `bool`) so the
+no-gradient path carries `acc[8]`. (Already templated on accumulator type; add the
+gradient flag as a second template parameter.)
 
-**Why (gain).** The FP64 `acc[24]` is *the* driver of the 91-register count that caps
-`gather24` occupancy. The no-gradient variant drops to ~8 accumulators → far fewer
-registers → higher occupancy. *Discrete:* **Med** (occupancy-bound HBM cards benefit
-directly). *GB10:* Low (bandwidth-bound). Cheap to do, measurable.
+**Why (gain).** The accumulator is the dominant register consumer — acute in the FP64
+variant (48 regs of accumulator → 91 total), but a win for FP32 too. The no-gradient
+variant drops to ~8 accumulators → far fewer registers → higher occupancy. *Discrete:*
+**Med** (occupancy-bound HBM cards benefit directly). *GB10:* Low (bandwidth-bound).
+Cheap to do, measurable. Most impactful as the way to make the FP64 path affordable.
 
 **How / cost.** Low effort, low risk (no math change; verify identical output).
 `cudaOccupancyMaxPotentialBlockSize` (already in place) will pick up the looser register
