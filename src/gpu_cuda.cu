@@ -326,6 +326,16 @@ __global__ void force_kernel(
 // ---- Skyrme/VDF field force (device update_momenta, non-momentum branch) -----
 // force = scale1*(FB.first + v x FB.second) + scale2*iso3*(FI3.first + v x FI3.second),
 // with FB/FI3 read nearest-node (6 floats each). No root-find / U(p,rho) table.
+//
+// Templated on the force-math precision Real (item 8): the FP32 SoA inputs are
+// promoted to Real for the velocity/cross-product/update arithmetic and the result
+// stored back FP32. Real=float (default) is bit-identical to the old kernel; on a
+// discrete FP64-strong card Real=double removes the FP32 force caveat essentially
+// for free (the field force is a tiny fraction of GPU time — see CUDA_Implementation.md
+// profiling — so FP64 here is a precision/flexibility knob, not a GB10 speed change).
+// The integer node lookup stays in float so the *cell* chosen is identical regardless
+// of Real; only the physics arithmetic changes precision.
+template <typename Real>
 __global__ void force_field_kernel(
     const float *__restrict__ rx, const float *__restrict__ ry,
     const float *__restrict__ rz, const float *__restrict__ px,
@@ -349,18 +359,18 @@ __global__ void force_field_kernel(
     npx[i] = Px; npy[i] = Py; npz[i] = Pz; return;  // outside lattice: unchanged
   }
   int node = (ix + nx * (iy + ny * iz)) * 6;
-  float b1x = fB[node], b1y = fB[node + 1], b1z = fB[node + 2];
-  float b2x = fB[node + 3], b2y = fB[node + 4], b2z = fB[node + 5];
-  float f1x = fi3[node], f1y = fi3[node + 1], f1z = fi3[node + 2];
-  float f2x = fi3[node + 3], f2y = fi3[node + 4], f2z = fi3[node + 5];
-  float P0 = p0[i];
-  float vx = Px / P0, vy = Py / P0, vz = Pz / P0;
-  float bcx = vy * b2z - vz * b2y, bcy = vz * b2x - vx * b2z, bcz = vx * b2y - vy * b2x;
-  float icx = vy * f2z - vz * f2y, icy = vz * f2x - vx * f2z, icz = vx * f2y - vy * f2x;
-  float s1 = scale1[i], s2i = scale2[i] * iso3[i];
-  npx[i] = Px + (s1 * (b1x + bcx) + s2i * (f1x + icx)) * dt;
-  npy[i] = Py + (s1 * (b1y + bcy) + s2i * (f1y + icy)) * dt;
-  npz[i] = Pz + (s1 * (b1z + bcz) + s2i * (f1z + icz)) * dt;
+  Real b1x = fB[node], b1y = fB[node + 1], b1z = fB[node + 2];
+  Real b2x = fB[node + 3], b2y = fB[node + 4], b2z = fB[node + 5];
+  Real f1x = fi3[node], f1y = fi3[node + 1], f1z = fi3[node + 2];
+  Real f2x = fi3[node + 3], f2y = fi3[node + 4], f2z = fi3[node + 5];
+  Real P0 = p0[i];
+  Real vx = (Real)Px / P0, vy = (Real)Py / P0, vz = (Real)Pz / P0;
+  Real bcx = vy * b2z - vz * b2y, bcy = vz * b2x - vx * b2z, bcz = vx * b2y - vy * b2x;
+  Real icx = vy * f2z - vz * f2y, icy = vz * f2x - vx * f2z, icz = vx * f2y - vy * f2x;
+  Real s1 = scale1[i], s2i = (Real)scale2[i] * iso3[i], DT = dt;
+  npx[i] = Px + (float)((s1 * (b1x + bcx) + s2i * (f1x + icx)) * DT);
+  npy[i] = Py + (float)((s1 * (b1y + bcy) + s2i * (f1y + icy)) * DT);
+  npz[i] = Pz + (float)((s1 * (b1z + bcz) + s2i * (f1z + icz)) * DT);
 }
 
 // Serialises backend dispatch: the backends share the per-function BufPools and
@@ -723,12 +733,22 @@ bool backend_force_field(const ForceJob &job) {
     npz = static_cast<float *>(pool.take(N * sizeof(float)));
   }
 
-  static int tpb = best_block_size(force_field_kernel);
-  int blocks = (N + tpb - 1) / tpb;
-  force_field_kernel<<<blocks, tpb, 0, stream>>>(
-      rx, ry, rz, px, py, pz, p0, s1, s2, i3, act, fB, fi3, N, job.nx, job.ny,
-      job.nz, job.periodic, job.ox, job.oy, job.oz, job.hx, job.hy, job.hz,
-      job.dt, npx, npy, npz);
+  // Field-force precision (item 8): FP32 by default (bit-identical), FP64 on the
+  // shared SMASH_GPU_FP64_ACC toggle for FP64-strong discrete cards.
+#define FIELD_FORCE_ARGS                                                        \
+  rx, ry, rz, px, py, pz, p0, s1, s2, i3, act, fB, fi3, N, job.nx, job.ny,      \
+      job.nz, job.periodic, job.ox, job.oy, job.oz, job.hx, job.hy, job.hz,     \
+      job.dt, npx, npy, npz
+  if (use_fp64_acc()) {
+    static int tpb = best_block_size(force_field_kernel<double>);
+    int blocks = (N + tpb - 1) / tpb;
+    force_field_kernel<double><<<blocks, tpb, 0, stream>>>(FIELD_FORCE_ARGS);
+  } else {
+    static int tpb = best_block_size(force_field_kernel<float>);
+    int blocks = (N + tpb - 1) / tpb;
+    force_field_kernel<float><<<blocks, tpb, 0, stream>>>(FIELD_FORCE_ARGS);
+  }
+#undef FIELD_FORCE_ARGS
   cudaError_t err;
   if (ats) {
     err = cudaDeviceSynchronize();

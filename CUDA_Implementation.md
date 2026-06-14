@@ -217,3 +217,95 @@ subsumes **item 5**, the single shared particle-SoA marshal), the lattice still
 round-trips and there is no win. The pieces are individually node-local/stencil
 kernels gateable on the collisionless drift harness built here; this is the
 documented production §3c effort and is left staged rather than landed half-fused.
+
+---
+
+## Profiling pass (gates Steps 4 and 5)
+
+[CudaNextSteps.md](CudaNextSteps.md#L287) makes items 4 and 7–9 conditional on a
+profiling pass and on item 1 fixing the per-step sequence. nsys on GB10 (`T=1`,
+`--trace=cuda`), collisionless md and box:
+
+| config | kernel | share of GPU time | per-call | memcpy |
+|---|---|---|---|---|
+| md  | `gather24<float,true>` (grad) | **99.6%** | ~17 ms | none (ATS) |
+| md  | `force_kernel` (root-find)     | 0.4% | ~139 µs | none |
+| box | `gather24<float,false>` (no-grad) | **96.8%** | ~0.91 ms | none |
+| box | `force_field_kernel`          | 3.2% | ~31 µs | none |
+
+**The gather is the whole game** (97–99.6%); the force is negligible and the ATS
+path moves no bytes. This sets every remaining decision:
+
+- **Launch overhead is irrelevant** — kernels are 0.9–17 ms, a launch is µs. So
+  **item 4 (CUDA graphs) cannot help on GB10** (see Step 4).
+- **The force is ~0.4–3.2%** — optimizing or FP64-ing it is a precision/flexibility
+  knob, not a GB10 speed change (item 8).
+- **The lever is the gather** — which means item 1 (resident fusion, to use
+  arithmetic throughput instead of round-tripping) or item 9 (its read pattern).
+  The detailed read-stall/occupancy breakdown needs `ncu`, which here returns
+  `ERR_NVGPUCTRPERM` (GPU performance counters require elevated permission); per
+  the doc's own *"profile first before investing in 7/9"*, that confirmation is a
+  prerequisite that is currently unavailable.
+
+---
+
+## Step 4 — Item 4: CUDA graphs (profiling-deferred, evidence-based)
+
+**Decision: correctly deferred, not implemented.** Item 4 amortizes per-launch
+overhead; the profiling shows that overhead is **negligible** here — one gather is
+0.9–17 ms versus a ~5–10 µs launch, and on the ATS hot path there are no copies to
+batch. Two independent reasons it would not pay off now:
+
+1. **No headroom.** Even batching every per-step launch saves µs against ms-scale
+   kernels — unmeasurable on GB10.
+2. **No fixed topology.** A graph replays a *captured* sequence cheaply only if the
+   launch configs / copy sizes are stable. Here `n_src` and the occupied-node box
+   `n_box` change every step (collisions), so a graph would need re-instantiation
+   each step (≈ its own launch cost), erasing the benefit. This is exactly the
+   doc's precondition — *"most effective after items 1–3 stabilize the per-step
+   sequence"* — and item 1's residency is staged (Step 3), so the sequence is not
+   yet fixed.
+
+The groundwork is in place: item 2's `disc_stream()` is already the
+graph-capturable unit, so once item 1 makes the per-step sequence resident and
+fixed-size, capture is a localized follow-up. Forcing it now would add a
+value-negative, re-instantiate-every-step code path. (On a discrete card the copy
+batching is a real but secondary win; it, too, wants the fixed sizes item 1 brings.)
+
+---
+
+## Step 5 — Items 7–9: profiling-gated kernel tuning
+
+**Item 8 — precision templating (implemented, field-force path).**
+`force_field_kernel` is now templated on a force-math precision `Real`
+([src/gpu_cuda.cu](src/gpu_cuda.cu)): FP32 SoA inputs are promoted to `Real` for
+the velocity / cross-product / momentum-update arithmetic and stored back FP32; the
+integer node lookup stays float so the *cell* is identical regardless of `Real`.
+Dispatched FP32 by default (bit-identical — drift **0.000e+00**, both transports)
+and FP64 on the shared `SMASH_GPU_FP64_ACC` toggle. FP64 vs the FP32 reference on
+the box: `max|Δp|/|p| = 1.4e-4`, `max|ΔE|/E = 1.7e-5`, particle count stable —
+i.e. it resolves the field force's inherent FP32 grain, for free on an FP64-strong
+discrete card. This mirrors the gather's existing `Acc` FP64 templating, so the
+**gather (the bottleneck) and the field force both have an FP64 path**; the
+momentum-dependent `force_kernel` root-find extends identically (replace the `*f`
+intrinsics with the generic `sqrt`/`fmin`/`fmax` overloads), left as a documented
+follow-up since it is 0.4% of GPU time and intrinsic-heavy.
+
+**Item 7 — coalesced SoA lattice output: deferred (unchanged from the doc).** The
+24-float/node write would have to change in lockstep across the CUDA kernel, the
+Metal kernel, and the host consumer `set_currents_from_gpu`, and the Metal half
+cannot be compile-tested off Apple hardware. The profiling also bounds the upside:
+the gather is **read**-dominated (the scattered per-pair particle loads), and the
+one-shot 24-float store is a small tail — so even a perfectly coalesced store moves
+little on GB10. Not worth the cross-backend contract risk here.
+
+**Item 9 — shared-memory cell staging / warp cooperation: the right target,
+gated.** The profiling confirms the gather is the bottleneck, and the doc's
+hypothesis is that its cost is the indirect, uncoalesced per-pair reads — which is
+precisely what item 9 restructures. But the doc explicitly says *profile first to
+confirm the read stall before investing*, and the `ncu` section that would confirm
+read-stall vs occupancy vs store bound is blocked here by `ERR_NVGPUCTRPERM`.
+Investing the high-effort, medium-risk staging/tiling rewrite without that
+confirmation is exactly what the doc warns against, so it is left gated on `ncu`
+access (or a discrete card where counters are available). The collisionless drift
+harness built in this work is ready to validate it bit-identically when undertaken.
