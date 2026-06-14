@@ -281,6 +281,64 @@ for the full Amdahl discussion.
 
 ---
 
+## Collisions: finding vs performing (what threads buy)
+
+A run with collisions does two things per timestep, and they parallelize
+**differently**:
+
+1. **Finding** — build a cell grid and search every cell (and its neighbours) for
+   candidate scatterings/decays, evaluating each candidate's cross section and, if
+   enabled, its **Pauli‑blocking** phase‑space factor. Output is a time‑ordered
+   heap of candidate actions. This is the geometric, search‑heavy part.
+2. **Performing** — pop the heap in **time order** and execute each action (sample
+   the final state, re‑check blocking, mutate the particle list, re‑find for the
+   products). Each action can invalidate later ones, so **within an ensemble this
+   is inherently sequential**.
+
+| Phase | `Ensembles: 1` | `Ensembles: N` |
+|---|---|---|
+| **Finding** | **cell‑parallel** — pair searches spread over grid cells ([experiment.h:2903](src/include/smash/experiment.h#L2903)), reproducible via deterministic per‑task seeds | ensemble‑parallel |
+| **Performing** | **serial** (one ensemble, time‑ordered) | ensemble‑parallel ([experiment.h:2805](src/include/smash/experiment.h#L2805)) |
+
+So with a **single** ensemble only *finding* scales; *performing* does not.
+Cell‑parallel finding additionally needs `Strings: False` and a non‑stochastic
+criterion ([experiment.h:2714](src/include/smash/experiment.h#L2714)). With
+**several** ensembles both phases scale — this is the headline 5.5–6.5× (8t) path,
+and the reason to prefer **`Ensembles ≥ OMP_NUM_THREADS`** (trade test‑particles
+for ensembles) whenever collisions are a real fraction of the runtime.
+
+**Worked example — `verify/config_box_VDF.yaml`.** This box starts at
+`Temperature: 0.001` GeV (≈ cold nuclear matter), so over 10 fm **no collision
+ever fires** — SMASH reports `Interactions: Pauli‑blocked/performed = 0/0`. The
+*performing* phase is therefore free, and the whole collision cost is *finding*:
+the per‑step pair search and Pauli‑blocking evaluation over 32 000 baryons. That
+finding is cell‑parallel (`Ensembles: 1`), so the run scales — but only the
+finding part (best‑of‑3 `Time real`, M3 Max, CPU, `End_Time=10`):
+
+| threads | full run | ≈ mean‑field | ≈ finding |
+|---|---|---|---|
+| 1  | 23.4 s | 3.3 s | 20.0 s |
+| 8  | 9.2 s  | 3.1 s | 6.1 s  (3.3×) |
+| 16 | 8.1 s  | 3.2 s | 4.9 s  (4.1×) |
+
+Finding parallelizes ~4× to 16 threads; the mean‑field is a near‑flat ~3 s floor
+on this small 20³ lattice — and that floor is exactly what the GPU then cuts to
+~1.5 s (above). For a **hotter** run where collisions actually fire, the
+*performing* phase grows and is serial per ensemble, so the same advice applies:
+raise `Ensembles`.
+
+**Can the GPU help here?** *Performing* is sequential, RNG‑heavy and branchy — not
+a GPU target. The finding **geometry** (cell/neighbour search) is data‑parallel in
+principle, but SMASH's **cross‑section evaluation** (dozens of channels, resonance
+integrals, particle‑type tables) is the actual cost — branch‑heavy,
+CPU‑data‑structure‑bound, and entangled with the per‑stream RNG that backs
+bit‑reproducibility — so a faithful port is a large project. The one collision‑side
+piece that maps cleanly onto the covariant‑Gaussian **gather** already on the GPU
+in this fork is the **Pauli‑blocking phase‑space average** (a spatial + momentum
+neighbour sum) — the natural next GPU candidate when blocking is on and dominates.
+
+---
+
 ## Reproducibility & correctness contract
 
 Two validation levels are used, matched to whether a change is expected to alter
