@@ -13,6 +13,7 @@
 !*.py
 !box_fast.yaml
 !box_heavy.yaml
+!config_box_VDF.yaml
 !potentials_nomd.yaml
 !potentials_md.yaml
 !strings_collider.yaml

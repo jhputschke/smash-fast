@@ -25,30 +25,54 @@ namespace smash {
 static constexpr int LPropagation = LogArea::Propagation::id;
 
 /**
- * GPU equivalent of the momentum-dependent, lattice-based update_momenta() loop
- * (PotentialNextSteps.md 3d): marshals every particle into a structure-of-arrays,
- * extracts the baryon-current (jmu_net) and symmetry (FI3) lattices and the
- * tabulated U(p,rho), runs the Metal/CUDA force kernel (per-particle root-find +
- * energy gradient + symmetry term), and writes the new momenta back. The kernel
- * reproduces the CPU force exactly up to FP32; validated by conservation.
+ * GPU equivalent of the lattice-based update_momenta() loop. Marshals every
+ * particle into a structure-of-arrays, extracts the field lattices, runs the
+ * Metal/CUDA force kernel, and writes the new momenta back. Two variants are
+ * dispatched by the kernel (\see gpu::ForceJob):
+ * - momentum-dependent Skyrme (\c md): per-particle root-find + energy gradient
+ *   over the tabulated U(p,rho) from the net-baryon current \c jB_lat;
+ * - (non-momentum) Skyrme / VDF: the field-lookup force from the precomputed
+ *   Skyrme/VDF force field \c FB_lat (same nearest-node form as the CPU loop's
+ *   `else` branch). The symmetry term reads \c FI3_lat in both.
+ * The kernel reproduces the CPU force up to FP32; validated by conservation.
  * \return true if it ran on the GPU; false to fall back to the CPU loop.
  */
 static bool update_momenta_on_gpu(
     std::vector<Particles> &ensembles, double dt, const Potentials &pot,
+    RectangularLattice<std::pair<ThreeVector, ThreeVector>> *FB_lat,
     RectangularLattice<std::pair<ThreeVector, ThreeVector>> *FI3_lat,
     DensityLattice *jB_lat) {
-  const std::array<int, 3> n_cells = jB_lat->n_cells();
-  const std::array<double, 3> origin = jB_lat->origin();
-  const std::array<double, 3> csize = jB_lat->cell_sizes();
+  const bool md = pot.use_momentum_dependence();
+  // Both lattices share geometry; read it from whichever this variant uses.
+  const std::array<int, 3> n_cells = md ? jB_lat->n_cells() : FB_lat->n_cells();
+  const std::array<double, 3> origin = md ? jB_lat->origin() : FB_lat->origin();
+  const std::array<double, 3> csize =
+      md ? jB_lat->cell_sizes() : FB_lat->cell_sizes();
+  const bool periodic = md ? jB_lat->periodic() : FB_lat->periodic();
   const long n_nodes =
       static_cast<long>(n_cells[0]) * n_cells[1] * n_cells[2];
 
-  // Net baryon current per node (4 floats) and symmetry field (6 floats).
-  std::vector<float> jB(4 * n_nodes);
-  for (long n = 0; n < n_nodes; n++) {
-    const FourVector j = (*jB_lat)[n].jmu_net();
-    jB[4 * n] = j[0]; jB[4 * n + 1] = j[1];
-    jB[4 * n + 2] = j[2]; jB[4 * n + 3] = j[3];
+  // Net baryon current per node (4 floats, md path) and symmetry field (6).
+  std::vector<float> jB;
+  if (md) {
+    jB.resize(4 * n_nodes);
+    for (long n = 0; n < n_nodes; n++) {
+      const FourVector j = (*jB_lat)[n].jmu_net();
+      jB[4 * n] = j[0]; jB[4 * n + 1] = j[1];
+      jB[4 * n + 2] = j[2]; jB[4 * n + 3] = j[3];
+    }
+  }
+  // Skyrme/VDF force field per node (6 floats: first vec3, second vec3) for the
+  // field path -- the same layout as fi3 below, read nearest-node in the kernel.
+  std::vector<float> fB;
+  if (!md) {
+    fB.resize(6 * n_nodes);
+    for (long n = 0; n < n_nodes; n++) {
+      const std::pair<ThreeVector, ThreeVector> &f = (*FB_lat)[n];
+      fB[6 * n] = f.first[0]; fB[6 * n + 1] = f.first[1];
+      fB[6 * n + 2] = f.first[2]; fB[6 * n + 3] = f.second[0];
+      fB[6 * n + 4] = f.second[1]; fB[6 * n + 5] = f.second[2];
+    }
   }
   std::vector<float> fi3(6 * n_nodes, 0.0f);
   if (pot.use_symmetry() && FI3_lat) {
@@ -61,12 +85,15 @@ static bool update_momenta_on_gpu(
   }
 
   // U(p,rho) table -> a cached FP32 copy (rebuilt only if the table changes).
+  // Only the md path reads it.
   static std::vector<float> Uf;
   static const void *Uptr = nullptr;
-  const std::vector<double> &Uvals = pot.lrf_table_values();
-  if (Uvals.data() != Uptr || Uf.size() != Uvals.size()) {
-    Uf.assign(Uvals.begin(), Uvals.end());
-    Uptr = Uvals.data();
+  if (md) {
+    const std::vector<double> &Uvals = pot.lrf_table_values();
+    if (Uvals.data() != Uptr || Uf.size() != Uvals.size()) {
+      Uf.assign(Uvals.begin(), Uvals.end());
+      Uptr = Uvals.data();
+    }
   }
 
   // Per-particle structure-of-arrays.
@@ -114,7 +141,9 @@ static bool update_momenta_on_gpu(
   job.p0 = p0.data(); job.meff = meff.data();
   job.scale1 = sc1.data(); job.scale2 = sc2.data(); job.iso3 = iso.data();
   job.active = active.data();
-  job.jB = jB.data(); job.fi3 = fi3.data();
+  job.jB = md ? jB.data() : nullptr;
+  job.fi3 = fi3.data();
+  job.fB = md ? nullptr : fB.data();
   job.nx = n_cells[0]; job.ny = n_cells[1]; job.nz = n_cells[2];
   job.ox = static_cast<float>(origin[0]);
   job.oy = static_cast<float>(origin[1]);
@@ -122,14 +151,16 @@ static bool update_momenta_on_gpu(
   job.hx = static_cast<float>(csize[0]);
   job.hy = static_cast<float>(csize[1]);
   job.hz = static_cast<float>(csize[2]);
-  job.U = Uf.data();
-  job.n_p = pot.lrf_table_np();
-  job.n_rho = pot.lrf_table_nrho();
-  job.inv_dp = static_cast<float>(pot.lrf_table_inv_dp());
-  job.inv_drho = static_cast<float>(pot.lrf_table_inv_drho());
-  job.p_max = static_cast<float>(pot.lrf_table_pmax());
-  job.rho_max = static_cast<float>(pot.lrf_table_rhomax());
+  job.U = md ? Uf.data() : nullptr;
+  job.n_p = md ? pot.lrf_table_np() : 0;
+  job.n_rho = md ? pot.lrf_table_nrho() : 0;
+  job.inv_dp = md ? static_cast<float>(pot.lrf_table_inv_dp()) : 0.f;
+  job.inv_drho = md ? static_cast<float>(pot.lrf_table_inv_drho()) : 0.f;
+  job.p_max = md ? static_cast<float>(pot.lrf_table_pmax()) : 0.f;
+  job.rho_max = md ? static_cast<float>(pot.lrf_table_rhomax()) : 0.f;
   job.niter = 40;
+  job.momentum_dependent = md ? 1 : 0;
+  job.periodic = periodic ? 1 : 0;
   job.dt = static_cast<float>(dt);
   job.npx = npx.data(); job.npy = npy.data(); job.npz = npz.data();
   if (!gpu::run_force(job)) {
@@ -286,14 +317,30 @@ void update_momenta(
       (pot.use_vdf() ? (FB_lat != nullptr) : true) &&
       (pot.use_symmetry() ? (FI3_lat != nullptr) : true);
 
-  // GPU force path: the momentum-dependent, lattice-based momentum update runs
-  // on the device when a backend is enabled and the case is supported (Skyrme +
-  // momentum dependence + optional symmetry; lattice currents present; no VDF /
-  // Coulomb / outside-lattice fallback). Falls back to the CPU loop otherwise.
-  if (gpu::force_enabled() && pot.use_momentum_dependence() && !pot.use_vdf() &&
-      !pot.use_coulomb() && !pot.use_potentials_outside_lattice() &&
-      possibly_use_lattice && jB_lat != nullptr && pot.lrf_table_ready()) {
-    if (update_momenta_on_gpu(ensembles, dt, pot, FI3_lat, jB_lat)) {
+  // GPU force path: the lattice-based momentum update runs on the device when a
+  // backend is enabled and the case is supported (lattice present; no Coulomb /
+  // outside-lattice fallback). Two variants: the momentum-dependent Skyrme
+  // root-find (needs the net-baryon current and the U(p,rho) table), or the
+  // (non-momentum) Skyrme/VDF field-lookup force (needs the precomputed force
+  // field FB_lat). Falls back to the CPU loop otherwise.
+  const bool gpu_md = pot.use_momentum_dependence();
+  const bool gpu_field = !gpu_md && (pot.use_skyrme() || pot.use_vdf());
+  // The "potentials outside lattice" fallback (the O(N^2) all_forces path for a
+  // particle outside the lattice) is never reached on a periodic lattice: every
+  // particle is inside (value_at always succeeds), so the field kernel -- which
+  // wraps the node index -- reproduces the CPU loop exactly and the flag is
+  // moot. On an open lattice this fallback can trigger, so require the flag off
+  // there. (Only the field kernel handles the periodic wrap; the md kernel does
+  // not, so it keeps the stricter open-lattice gate.)
+  const bool field_periodic =
+      gpu_field && FB_lat != nullptr && FB_lat->periodic();
+  const bool outside_ok =
+      !pot.use_potentials_outside_lattice() || field_periodic;
+  if (gpu::force_enabled() && !pot.use_coulomb() && outside_ok &&
+      possibly_use_lattice &&
+      ((gpu_md && jB_lat != nullptr && pot.lrf_table_ready()) ||
+       (gpu_field && FB_lat != nullptr))) {
+    if (update_momenta_on_gpu(ensembles, dt, pot, FB_lat, FI3_lat, jB_lat)) {
       return;
     }
   }
