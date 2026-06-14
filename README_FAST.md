@@ -310,8 +310,9 @@ for ensembles) whenever collisions are a real fraction of the runtime.
 **Worked example — `verify/config_box_VDF.yaml`.** This box starts at
 `Temperature: 0.001` GeV (≈ cold nuclear matter), so over 10 fm **no collision
 ever fires** — SMASH reports `Interactions: Pauli‑blocked/performed = 0/0`. The
-*performing* phase is therefore free, and the whole collision cost is *finding*:
-the per‑step pair search and Pauli‑blocking evaluation over 32 000 baryons. That
+*performing* phase (and with it Pauli blocking, which only runs on performed
+actions) is therefore free, and the whole collision cost is *finding*: the
+per‑step pair search and cross‑section evaluation over 32 000 baryons. That
 finding is cell‑parallel (`Ensembles: 1`), so the run scales — but only the
 finding part (best‑of‑3 `Time real`, M3 Max, CPU, `End_Time=10`):
 
@@ -325,17 +326,26 @@ Finding parallelizes ~4× to 16 threads; the mean‑field is a near‑flat ~3 s 
 on this small 20³ lattice — and that floor is exactly what the GPU then cuts to
 ~1.5 s (above). For a **hotter** run where collisions actually fire, the
 *performing* phase grows and is serial per ensemble, so the same advice applies:
-raise `Ensembles`.
+raise `Ensembles`. (Raised to `Temperature: 0.15` GeV this box fires 3431
+collisions in 2 fm, and it is that serial performing — not Pauli blocking — that
+caps thread scaling at ~1.7×.)
 
-**Can the GPU help here?** *Performing* is sequential, RNG‑heavy and branchy — not
-a GPU target. The finding **geometry** (cell/neighbour search) is data‑parallel in
-principle, but SMASH's **cross‑section evaluation** (dozens of channels, resonance
-integrals, particle‑type tables) is the actual cost — branch‑heavy,
-CPU‑data‑structure‑bound, and entangled with the per‑stream RNG that backs
-bit‑reproducibility — so a faithful port is a large project. The one collision‑side
-piece that maps cleanly onto the covariant‑Gaussian **gather** already on the GPU
-in this fork is the **Pauli‑blocking phase‑space average** (a spatial + momentum
-neighbour sum) — the natural next GPU candidate when blocking is on and dominates.
+**Is Pauli blocking worth optimizing?** It runs only on performed actions, in the
+serial performing phase, as an O(N) brute‑force scan over all particles
+([pauliblocking.cc:52](src/pauliblocking.cc#L52), with a standing "inefficient"
+TODO). But measured it is **not** a bottleneck here: even hot it costs only ~0.4 s
+(~6%). Its cost grows as (collisions × N), so for a large, dense, hot run it can
+matter — there the fix is the **neighbour search** the TODO asks for (reuse the
+finder's cell grid → O(neighbours)), which is exact and CPU‑side, not a GPU job.
+
+**Can the GPU help the collision side at all?** *Performing* is sequential,
+RNG‑heavy and branchy — not a GPU target. The finding **geometry** (cell/neighbour
+search) is data‑parallel in principle, but SMASH's **cross‑section evaluation**
+(dozens of channels, resonance integrals, particle‑type tables) is the actual cost
+— branch‑heavy, CPU‑data‑structure‑bound, and entangled with the per‑stream RNG
+that backs bit‑reproducibility — so a faithful port is a large project. In short
+the collision side is best left on the (already cell‑/ensemble‑parallel) CPU; the
+GPU win in this fork is the mean‑field gather.
 
 ---
 
