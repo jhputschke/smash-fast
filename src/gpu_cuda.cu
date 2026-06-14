@@ -11,10 +11,11 @@
 // toolkit is found (see src/CMakeLists.txt). The kernel ports the MSL kernel in
 // gpu_metal.mm: one thread per lattice node, cell-list neighbourhood scan, FP32
 // per-pair smearing, accumulating the 24 floats/node (jmu_pos, jmu_neg,
-// djmu_dxnu) that DensityOnLattice stores. Per the §3a precision study the gather
-// accumulates each node in FP64 (mixed precision: FP32 per-pair math, FP64 sum) —
-// GB10 does the FP64 add essentially for free and it removes the density-dependent
-// √N·ε drift that naive FP32 summation develops at high occupancy.
+// djmu_dxnu) that DensityOnLattice stores. The per-node accumulator is FP32 by
+// default (matches the Metal backend and is within the accepted precision regime
+// at SIS density, §3a); SMASH_GPU_FP64_ACC=1 switches it to FP64 for high-density
+// precision studies (the §3a √N·ε study) at the cost of ~1.5x gather time on a
+// large lattice (the wider accumulator halves occupancy). See use_fp64_acc().
 //
 // Memory model. Two paths, chosen once at init (see use_ats()):
 //   * Coherent / unified (GB10, Grace-Blackwell, ATS): the device can access
@@ -44,7 +45,10 @@ __device__ inline int pmod(int a, int n) { int m = a % n; return m < 0 ? m + n :
 
 // Read-only inputs are marked const __restrict__ so the compiler may route the
 // scattered per-pair gathers (sx[p], px[p], ... indexed through bin_part) through
-// the read-only data cache (LDG) and assume no aliasing with `out`.
+// the read-only data cache (LDG) and assume no aliasing with `out`. Templated on
+// the node-accumulator type Acc (see backend_gather): FP32 by default (fast,
+// matches the Metal backend), FP64 opt-in for high-density precision studies.
+template <typename Acc>
 __global__ void gather24(const float *__restrict__ sx,
                          const float *__restrict__ sy,
                          const float *__restrict__ sz,
@@ -87,11 +91,14 @@ __global__ void gather24(const float *__restrict__ sx,
     bcz = (int)floorf((ncz - oz) / rcut);
   }
 
-  // FP64 node accumulator (mixed precision): the per-pair work below stays FP32,
-  // but folding hundreds of pairs into the node sum in FP64 removes the √N·ε
-  // drift/bias that naive FP32 accumulation develops at high density (§3a study).
-  double acc[24];
-  for (int c = 0; c < 24; c++) acc[c] = 0.0;
+  // Node accumulator (type chosen by the caller). The per-pair work below stays
+  // FP32; only the per-node sum is in Acc. FP64 removes the √N·ε drift/bias that
+  // naive FP32 accumulation develops at high density (§3a study) but doubles the
+  // accumulator's register footprint (24 -> 48 regs), which on a large lattice
+  // cuts gather occupancy hard (measured ~1.5x slower on the 80³ potentials_md
+  // gather) — hence FP32 is the default and FP64 is opt-in.
+  Acc acc[24];
+  for (int c = 0; c < 24; c++) acc[c] = Acc(0);
 
   for (int dz = -1; dz <= 1; dz++) { int bz = bcz + dz; if (periodic) bz = pmod(bz, nbz); else if (bz < 0 || bz >= nbz) continue;
    for (int dy = -1; dy <= 1; dy++) { int by = bcy + dy; if (periodic) by = pmod(by, nby); else if (by < 0 || by >= nby) continue;
@@ -327,6 +334,23 @@ bool use_ats() {
   return cached == 1;
 }
 
+// Whether to accumulate the gather per node in FP64. Default off: FP32 matches the
+// Metal backend, is within the accepted precision regime at SIS density (§3a), and
+// avoids the gather-occupancy penalty of the wider accumulator. SMASH_GPU_FP64_ACC=1
+// opts into the precise (but ~1.5x slower on a large lattice) FP64 accumulator for
+// high-density precision studies.
+bool use_fp64_acc() {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *e = std::getenv("SMASH_GPU_FP64_ACC");
+    cached = (e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0 ||
+                    std::strcmp(e, "true") == 0))
+                 ? 1
+                 : 0;
+  }
+  return cached == 1;
+}
+
 // One grow-only device allocation, reused across calls (no per-call malloc/free).
 struct DevBuf {
   void *d = nullptr;
@@ -421,14 +445,23 @@ bool backend_gather(const GatherJob &job) {
     cudaMemset(out, 0, 24 * n_nodes * sizeof(float));
   }
 
-  static int tpb = best_block_size(gather24);
-  long blocks = (n_box + tpb - 1) / tpb;
-  gather24<<<blocks, tpb>>>(sx, sy, sz, p0, px, py, pz, df, bs, bp,
-                            job.nx, job.ny, job.nz, job.nbx, job.nby, job.nbz,
-                            job.glx, job.gly, job.glz, job.gux, job.guy, job.guz,
-                            job.ox, job.oy, job.oz, job.hx, job.hy, job.hz,
-                            job.rcut, job.two_sig_sqr_inv, job.norm,
-                            job.compute_gradient, job.periodic, out);
+  // Dispatch the FP32 or FP64 accumulator instantiation; each caches its own
+  // occupancy-optimal block size (the FP64 variant uses more registers).
+#define GATHER_ARGS                                                            \
+  sx, sy, sz, p0, px, py, pz, df, bs, bp, job.nx, job.ny, job.nz, job.nbx,     \
+      job.nby, job.nbz, job.glx, job.gly, job.glz, job.gux, job.guy, job.guz,  \
+      job.ox, job.oy, job.oz, job.hx, job.hy, job.hz, job.rcut,                \
+      job.two_sig_sqr_inv, job.norm, job.compute_gradient, job.periodic, out
+  if (use_fp64_acc()) {
+    static int tpb = best_block_size(gather24<double>);
+    long blocks = (n_box + tpb - 1) / tpb;
+    gather24<double><<<blocks, tpb>>>(GATHER_ARGS);
+  } else {
+    static int tpb = best_block_size(gather24<float>);
+    long blocks = (n_box + tpb - 1) / tpb;
+    gather24<float><<<blocks, tpb>>>(GATHER_ARGS);
+  }
+#undef GATHER_ARGS
   cudaError_t err = cudaDeviceSynchronize();
   bool ok = (err == cudaSuccess);
   if (!ok) {
