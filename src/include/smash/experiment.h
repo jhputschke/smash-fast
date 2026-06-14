@@ -8,10 +8,12 @@
 #define SRC_INCLUDE_SMASH_EXPERIMENT_H_
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #ifdef _OPENMP
@@ -642,6 +644,17 @@ class Experiment : public ExperimentBase {
   /// This indicates whether to use the grid.
   const bool use_grid_;
 
+  /**
+   * Whether to use lazy propagation in the timestepless evolution: the
+   * per-action propagation advances only the colliding/candidate particles
+   * rather than the whole ensemble (the rest are flushed at the end of the
+   * call). Faster on collision-heavy runs, but not bit-identical to the eager
+   * path (one-step vs many-step position updates differ at FP level); it
+   * conserves and is reproducible at a fixed seed/thread count. The
+   * SMASH_LAZY_PROP environment variable forces it on regardless of this key.
+   */
+  const bool lazy_propagation_;
+
   /// This struct contains information on the metric to be used
   const ExpansionProperties metric_;
 
@@ -1040,6 +1053,7 @@ Experiment<Modus>::Experiment(Configuration &config,
       delta_time_startup_(parameters_.labclock->timestep_duration()),
       force_decays_(config.take(InputKeys::collTerm_forceDecaysAtEnd)),
       use_grid_(config.take(InputKeys::gen_useGrid)),
+      lazy_propagation_(config.take(InputKeys::collTerm_lazyPropagation)),
       metric_(config.take(InputKeys::gen_metricType),
               config.take(InputKeys::gen_expansionRate)),
       dileptons_switch_(config.take(InputKeys::collTerm_dileptons_decays)),
@@ -2965,6 +2979,80 @@ void Experiment<Modus>::find_actions_cell_parallel(const G &grid, double dt,
   }
 }
 
+/**
+ * A uniform spatial hash that replaces the O(N) partner re-search after each
+ * performed collision in run_time_evolution_timestepless() with an
+ * O(neighbours) lookup.
+ *
+ * It stores *copies* of the particles, binned by position at the start of the
+ * timestepless call. Copies carry the storage index, so the live current state
+ * of a candidate is fetched with Particles::lookup() and entries that have since
+ * been consumed are skipped with Particles::is_valid(); collision products are
+ * add()ed as they are created. The cell edge is compute_min_cell_length(dt) (the
+ * same bound the finding grid trusts), and the query scans a +-2 cell box to
+ * absorb the intra-step drift of the snapshot positions, so the candidate set is
+ * a superset of the colliding partners the full scan would find -- the resulting
+ * actions are therefore the same set, hence (for distinct execution times) a
+ * bit-identical action heap.
+ */
+class ReSearchCellList {
+ public:
+  ReSearchCellList(const Particles &particles, double cell_len)
+      : inv_(1.0 / cell_len) {
+    for (const ParticleData &p : particles) {
+      add(p);
+    }
+  }
+  void add(const ParticleData &p) {
+    cells_[key(p.position().threevec())].push_back(p);
+  }
+  /// Live, deduplicated nearby particles for the outgoing set.
+  void candidates(const ParticleList &outgoing, const Particles &particles,
+                  ParticleList &out) const {
+    out.clear();
+    for (const ParticleData &o : outgoing) {
+      const std::array<int, 3> c = cell(o.position().threevec());
+      for (int dz = -2; dz <= 2; dz++) {
+        for (int dy = -2; dy <= 2; dy++) {
+          for (int dx = -2; dx <= 2; dx++) {
+            const auto it = cells_.find(pack(c[0] + dx, c[1] + dy, c[2] + dz));
+            if (it == cells_.end()) {
+              continue;
+            }
+            for (const ParticleData &cp : it->second) {
+              if (particles.is_valid(cp)) {
+                out.push_back(particles.lookup(cp));
+              }
+            }
+          }
+        }
+      }
+    }
+    // Deduplicate by particle id (a candidate may sit near several outgoing
+    // particles, and the full scan would consider it only once).
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+  }
+
+ private:
+  std::array<int, 3> cell(const ThreeVector &r) const {
+    return {static_cast<int>(std::floor(r.x1() * inv_)),
+            static_cast<int>(std::floor(r.x2() * inv_)),
+            static_cast<int>(std::floor(r.x3() * inv_))};
+  }
+  int64_t key(const ThreeVector &r) const {
+    const std::array<int, 3> c = cell(r);
+    return pack(c[0], c[1], c[2]);
+  }
+  /// Pack three (small) cell indices into one key (21 bits each, biased).
+  static int64_t pack(int x, int y, int z) {
+    constexpr int64_t bias = 1 << 20;
+    return ((x + bias) << 42) | ((y + bias) << 21) | (z + bias);
+  }
+  double inv_;
+  std::unordered_map<int64_t, ParticleList> cells_;
+};
+
 template <typename Modus>
 void Experiment<Modus>::run_time_evolution_timestepless(
     Actions &actions, int i_ensemble, const double end_time_propagation) {
@@ -2982,6 +3070,41 @@ void Experiment<Modus>::run_time_evolution_timestepless(
     finder->reseed_string_process();
   }
 
+  // The post-collision partner re-search uses a spatial hash (ReSearchCellList)
+  // instead of scanning every particle: O(neighbours) rather than O(N), and
+  // bit-identical to the full scan (the candidate box is a conservative superset
+  // of the colliding partners, evaluated by the same per-pair test). Built once
+  // over this call's particle snapshot; the stochastic criterion does no
+  // surrounding-particle search, so it is skipped there.
+  const bool use_celllist =
+      parameters_.coll_crit != CollisionCriterion::Stochastic &&
+      !actions.is_empty();
+  // Optional lazy propagation (Collision_Term: Lazy_Propagation, or the
+  // SMASH_LAZY_PROP env override): defer the per-action propagate-all to an
+  // on-demand propagation of just the colliding/candidate particles; the rest
+  // are flushed to end_time at the close. Not bit-identical to eager
+  // propagation (see the config-key docs); restricted to the sound cases (no
+  // per-step dilepton shining, no frozen-Fermi beam propagation, non-stochastic
+  // criterion) and otherwise off.
+  static const bool env_lazy = std::getenv("SMASH_LAZY_PROP") != nullptr;
+  const bool use_lazy = (lazy_propagation_ || env_lazy) &&
+                        dilepton_finder_ == nullptr && beam_momentum_.empty() &&
+                        parameters_.coll_crit != CollisionCriterion::Stochastic;
+  std::unique_ptr<ReSearchCellList> celllist;
+  ParticleList cl_candidates;
+  if (use_celllist) {
+    celllist = std::make_unique<ReSearchCellList>(
+        particles,
+        compute_min_cell_length(parameters_.labclock->timestep_duration()));
+  }
+  // Advance a single ParticleData by straight-line motion to `to_time` (the
+  // no-Fermi propagation; lazy mode is gated to that case).
+  const auto propagate_one = [](ParticleData &p, double to_time) {
+    const double pdt = to_time - p.position().x0();
+    p.set_4position(FourVector(
+        to_time, p.position().threevec() + pdt * p.velocity()));
+  };
+
   // iterate over all actions
   while (!actions.is_empty()) {
     if (actions.earliest_time() > end_time_propagation) {
@@ -2998,8 +3121,21 @@ void Experiment<Modus>::run_time_evolution_timestepless(
     logg[LExperiment].debug(~einhard::Green(), "✔ ", act,
                             ", action time = ", act->time_of_execution());
 
-    /* (1) Propagate to the next action. */
-    propagate_and_shine(act->time_of_execution(), particles);
+    /* (1) Propagate to the next action. Lazy mode advances only the incoming
+     * particles (the rest stay put until they participate or until the
+     * end-of-call flush); the eager path advances every particle. */
+    if (use_lazy) {
+      for (const ParticleData &ic : act->incoming_particles()) {
+        if (!particles.is_valid(ic)) {
+          continue;
+        }
+        ParticleData moved = particles.lookup(ic);
+        propagate_one(moved, act->time_of_execution());
+        particles.update_particle(ic, moved);
+      }
+    } else {
+      propagate_and_shine(act->time_of_execution(), particles);
+    }
 
     /* (2) Perform action.
      *
@@ -3027,9 +3163,34 @@ void Experiment<Modus>::run_time_evolution_timestepless(
       // Outgoing particles can still decay, cross walls...
       actions.insert(finder->find_actions_in_cell(outgoing_particles, time_left,
                                                   gcell_vol, beam_momentum_));
-      // ... and collide with other particles.
-      actions.insert(finder->find_actions_with_surrounding_particles(
-          outgoing_particles, particles, time_left, beam_momentum_));
+      // ... and collide with other particles. The scatter finder's O(N) scan
+      // over `particles` is replaced by a candidate lookup when the cell-list
+      // prototype is on; the other finders ignore the surrounding list.
+      ScatterActionsFinder *saf =
+          celllist ? dynamic_cast<ScatterActionsFinder *>(finder.get())
+                   : nullptr;
+      if (saf) {
+        celllist->candidates(outgoing_particles, particles, cl_candidates);
+        if (use_lazy) {
+          // Bring the (lazily-propagated) candidate copies to the collision time
+          // so the geometry matches; their stored state stays put.
+          for (ParticleData &cand : cl_candidates) {
+            propagate_one(cand, act->time_of_execution());
+          }
+        }
+        actions.insert(saf->find_actions_with_surrounding_particles(
+            outgoing_particles, cl_candidates, time_left, beam_momentum_));
+      } else {
+        actions.insert(finder->find_actions_with_surrounding_particles(
+            outgoing_particles, particles, time_left, beam_momentum_));
+      }
+    }
+    // Keep the spatial hash current: the products are live particles that later
+    // collisions in this call must be able to find.
+    if (celllist) {
+      for (const ParticleData &op : outgoing_particles) {
+        celllist->add(op);
+      }
     }
 
     check_interactions_total(ens_scalars_[i_ensemble].interactions_total);

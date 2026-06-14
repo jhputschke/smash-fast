@@ -619,6 +619,33 @@ ActionList ScatterActionsFinder::find_actions_with_surrounding_particles(
   return actions;
 }
 
+ActionList ScatterActionsFinder::find_actions_with_surrounding_particles(
+    const ParticleList& search_list, const ParticleList& surrounding_list,
+    double dt, const std::vector<FourVector>& beam_momentum) const {
+  // Identical per-pair logic to the Particles overload above; only the
+  // surrounding container is a pre-filtered candidate list. Kept as a separate
+  // overload (not a template) to stay out of the virtual-dispatch header.
+  std::vector<ActionPtr> actions;
+  if (finder_parameters_.coll_crit == CollisionCriterion::Stochastic) {
+    return actions;
+  }
+  for (const ParticleData& p2 : surrounding_list) {
+    auto result = std::find_if(
+        search_list.begin(), search_list.end(),
+        [&p2](const ParticleData& p) { return p.id() == p2.id(); });
+    if (result != search_list.end()) {
+      continue;
+    }
+    for (const ParticleData& p1 : search_list) {
+      ActionPtr act = check_collision_two_part(p1, p2, dt, beam_momentum);
+      if (act) {
+        actions.push_back(std::move(act));
+      }
+    }
+  }
+  return actions;
+}
+
 void ScatterActionsFinder::dump_reactions() const {
   constexpr double time = 0.0;
 
