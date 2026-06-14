@@ -190,22 +190,23 @@ energy to ~5e‑8 vs CPU.
 
 | threads | CPU | GPU gather, **force CPU** | GPU gather+force |
 |---|---|---|---|
-| 1  | 3.34 s | **1.70 s — 1.97×** | 1.83 s — 1.83× |
-| 8  | 3.06 s | **1.45 s — 2.11×** | 1.62 s — 1.89× |
-| 16 | 3.15 s | **1.39 s — 2.27×** | 1.62 s — 1.94× |
+| 1  | 3.87 s | **2.16 s — 1.79×** | 2.25 s — 1.72× |
+| 8  | 3.63 s | **1.93 s — 1.88×** | 2.06 s — 1.76× |
+| 16 | 3.61 s | **1.87 s — 1.93×** | 2.04 s — 1.77× |
 
-The gather makes the box mean‑field ~2× faster, and the gap *grows* with threads
-(the CPU gather scales poorly on this small lattice while the device gather is
-flat). Keeping the cheap VDF force on the CPU (`SMASH_GPU_FORCE=off`) is the
-fastest column at every thread count. The GPU box result conserves identically to
-the CPU (the built‑in 4‑momentum‑violation figure matches to the printed digit)
+The gather makes the box mean‑field ~1.8–1.9× faster, and the gap *grows* with
+threads (the CPU gather scales poorly on this small lattice while the device
+gather is flat). Keeping the cheap VDF force on the CPU (`SMASH_GPU_FORCE=off`) is
+the fastest column at every thread count. The GPU box result conserves identically
+to the CPU (the built‑in 4‑momentum‑violation figure matches to the printed digit)
 and tracks the CPU trajectory to ~1e‑5 GeV.
 
 > **Collisions dilute the *end‑to‑end* gain.** `config_box_VDF.yaml` runs with
-> 2→2 collisions on, and for this dense box the collision finding/performing (CPU)
-> dominates the wall time. The **whole‑run** GPU speedup is therefore only **1.05×
-> (1t) → 1.24× (16t)**, even though the mean‑field step it accelerates is ~2×
-> faster — the GPU helps in proportion to the mean‑field fraction of your runtime.
+> 2→2 collisions on (≈13 000 of them at `Temperature: 0.1`), and for this box the
+> collision finding/performing (CPU) dominates the wall time. The **whole‑run** GPU
+> speedup is therefore only **~1.1×**, even though the mean‑field step it
+> accelerates is ~2× faster — the GPU helps in proportion to the mean‑field
+> fraction of your runtime (see the collision section below).
 
 Standalone GPU kernels (gather, force/root‑find, a resident multi‑step loop) and
 their CUDA companions live in [`gpu/`](gpu/); design notes are in
@@ -228,7 +229,7 @@ Pythia 8.316; "evolution time" excludes the one‑time serial cache warm‑up):
 | **`Ensembles: 1`, `Strings: False`, non‑stochastic criterion** | cell‑parallel pair search | 1.65× (2t), 2.66× (4t), 3.9× (8t) | `verify/box_heavy.yaml` with 1 ensemble |
 | **`Potentials:` (mean field)** | tabulated root‑find (deterministic) + **gather density fill for ≥ 4 threads** + node‑parallel force loops | 1.13× (1t, tabulation only), 1.54× (4t), **2.43× (8t)** | `input/potentials`, `verify/potentials_nomd.yaml`, `verify/potentials_md.yaml` |
 | **`Potentials:` + GPU detected** (Collider, Covariant Gaussian, `Gpu: auto`) | density lattice fill **and** the force (momentum‑dependent root‑find, or the Skyrme/VDF field lookup) offloaded to **Metal/CUDA** | **5.0× (1t), 2.4× (8t)** over the CPU mean‑field path at the same thread count *(M3 Max)* | engages for any Covariant‑Gaussian potentials run; non‑potentials runs unaffected. `verify/potentials_md.yaml` |
-| **`Potentials:` + GPU, Box modus** (periodic lattice, VDF/Skyrme) | the **periodic** density gather on the device (cell‑list wrapped mod cell count, minimum‑image); the cheap field force is best kept on the CPU (`SMASH_GPU_FORCE=off`) | **~2× mean‑field** (1.97× 1t → 2.27× 16t); whole‑run **1.05–1.24×** when 2→2 collisions are on (collision‑bound) *(M3 Max)* | new — lifts the old non‑periodic restriction. `verify/config_box_VDF.yaml` |
+| **`Potentials:` + GPU, Box modus** (periodic lattice, VDF/Skyrme) | the **periodic** density gather on the device (cell‑list wrapped mod cell count, minimum‑image); the cheap field force is best kept on the CPU (`SMASH_GPU_FORCE=off`) | **~1.8–1.9× mean‑field** (1.79× 1t → 1.93× 16t); whole‑run **~1.1×** when 2→2 collisions are on (collision‑bound) *(M3 Max)* | new — lifts the old non‑periodic restriction. `verify/config_box_VDF.yaml` |
 
 Key mean‑field detail: the density smearing switches from the serial **scatter**
 to the node‑parallel **gather** only when **≥ 4 threads** are available (the
@@ -307,36 +308,37 @@ criterion ([experiment.h:2714](src/include/smash/experiment.h#L2714)). With
 and the reason to prefer **`Ensembles ≥ OMP_NUM_THREADS`** (trade test‑particles
 for ensembles) whenever collisions are a real fraction of the runtime.
 
-**Worked example — `verify/config_box_VDF.yaml`.** This box starts at
-`Temperature: 0.001` GeV (≈ cold nuclear matter), so over 10 fm **no collision
-ever fires** — SMASH reports `Interactions: Pauli‑blocked/performed = 0/0`. The
-*performing* phase (and with it Pauli blocking, which only runs on performed
-actions) is therefore free, and the whole collision cost is *finding*: the
-per‑step pair search and cross‑section evaluation over 32 000 baryons. That
-finding is cell‑parallel (`Ensembles: 1`), so the run scales — but only the
-finding part (best‑of‑3 `Time real`, M3 Max, CPU, `End_Time=10`):
+**Worked example — `verify/config_box_VDF.yaml`.** This box runs at
+`Temperature: 0.1` GeV with 2→2 collisions on, so over 10 fm it fires
+**13 353 collisions** (`Interactions: Pauli‑blocked/performed = 168/13353`). Both
+phases are exercised, and the run **barely scales** with threads (best‑of‑2 `Time
+real`, M3 Max, CPU, `End_Time=10`):
 
-| threads | full run | ≈ mean‑field | ≈ finding |
-|---|---|---|---|
-| 1  | 23.4 s | 3.3 s | 20.0 s |
-| 8  | 9.2 s  | 3.1 s | 6.1 s  (3.3×) |
-| 16 | 8.1 s  | 3.2 s | 4.9 s  (4.1×) |
+| threads | full run (CPU) | scaling |
+|---|---|---|
+| 1  | 34.5 s | — |
+| 8  | 19.4 s | 1.77× |
+| 16 | 18.5 s | 1.87× |
 
-Finding parallelizes ~4× to 16 threads; the mean‑field is a near‑flat ~3 s floor
-on this small 20³ lattice — and that floor is exactly what the GPU then cuts to
-~1.5 s (above). For a **hotter** run where collisions actually fire, the
-*performing* phase grows and is serial per ensemble, so the same advice applies:
-raise `Ensembles`. (Raised to `Temperature: 0.15` GeV this box fires 3431
-collisions in 2 fm, and it is that serial performing — not Pauli blocking — that
-caps thread scaling at ~1.7×.)
+The reason is the finding/performing split. *Finding* is cell‑parallel and would
+scale ~4× on its own (the **cold** limit of this same box — drop the temperature
+so 0 collisions fire — does exactly that: 20.0 s → 4.9 s, 1→16t). But *performing*
+the 13 353 collisions is **serial** (`Ensembles: 1`, time‑ordered, each action
+mutating the list) and becomes the dominant term past a few threads — a textbook
+Amdahl wall. The mean‑field is a separate ~3.7 s floor (which the GPU cuts to ~2 s,
+above). **The lever is `Ensembles`:** splitting the box into N ensembles
+parallelizes *performing* too — the headline 5.5–6.5× (8t) path — whereas more
+threads on one ensemble cannot.
 
-**Is Pauli blocking worth optimizing?** It runs only on performed actions, in the
-serial performing phase, as an O(N) brute‑force scan over all particles
-([pauliblocking.cc:52](src/pauliblocking.cc#L52), with a standing "inefficient"
-TODO). But measured it is **not** a bottleneck here: even hot it costs only ~0.4 s
-(~6%). Its cost grows as (collisions × N), so for a large, dense, hot run it can
-matter — there the fix is the **neighbour search** the TODO asks for (reuse the
-finder's cell grid → O(neighbours)), which is exact and CPU‑side, not a GPU job.
+Note that **Pauli blocking is *not* the wall**, even though it lives in that serial
+phase: it costs only ~0.3–0.8 s here. It runs only on performed actions, as an O(N)
+brute‑force scan over all particles ([pauliblocking.cc:52](src/pauliblocking.cc#L52),
+with a standing "inefficient" TODO), but that is cheap at this collision count. Its
+cost grows as (collisions × N), so a much larger/denser run could make it matter —
+the fix there is the **neighbour search** the TODO asks for (reuse the finder's
+cell grid → O(neighbours)), exact and CPU‑side, not a GPU job. Turning the GPU on
+speeds this collision‑bound run by only **~1.1×** end‑to‑end, even though it makes
+the mean‑field slice ~1.8× faster.
 
 **Can the GPU help the collision side at all?** *Performing* is sequential,
 RNG‑heavy and branchy — not a GPU target. The finding **geometry** (cell/neighbour

@@ -32,7 +32,7 @@ Output:
 Modi:
     Box:
         Length: 20.0
-        Temperature: 0.001
+        Temperature: 0.1
         Initial_Condition: "thermal momenta quantum"
         Start_Time: 0.0
         Init_Multiplicities:
