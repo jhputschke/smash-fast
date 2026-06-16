@@ -23,6 +23,7 @@ bool backend_available();
 const char *backend_name();
 bool backend_gather(const GatherJob &job);
 bool backend_force(const ForceJob &job);
+bool backend_gather_builds_cell_list();
 }  // namespace detail
 
 namespace {
@@ -96,6 +97,10 @@ bool force_enabled() {
     return mode_from_string(e) != Mode::Off;
   }
   return true;
+}
+
+bool gather_builds_cell_list() {
+  return enabled() && detail::backend_gather_builds_cell_list();
 }
 
 bool run_gather(const GatherJob &job) { return detail::backend_gather(job); }

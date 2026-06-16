@@ -102,6 +102,14 @@ struct GatherJob {
 bool run_gather(const GatherJob &job);
 
 /**
+ * \return whether the active backend builds the gather cell-list on the device
+ * (item 3, CUDA + \c SMASH_GPU_CELLLIST). When true the caller may leave
+ * \c GatherJob::bin_start / \c bin_part null and skip the host counting sort — the
+ * backend rebuilds an identical cell-list on the device from the positions.
+ */
+bool gather_builds_cell_list();
+
+/**
  * Plain-data description of one momentum-dependent force / momentum-update call
  * (the device version of update_momenta() for the lattice-based,
  * momentum-dependent Skyrme + symmetry potential). Per particle the kernel forms
