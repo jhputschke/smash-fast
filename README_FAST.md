@@ -412,6 +412,13 @@ the random‑number stream:
   multi‑threaded potential / heavy‑string runs by conservation, not by
   byte‑identity.**
 
+**Thread‑safety fix.** `list_possible_resonances()` fills a lookup table lazily and
+is called from every finder thread; it is now guarded by a reader/writer lock.
+Before, two threads meeting a new pair of particle types at the same moment could
+corrupt the table — an intermittent segfault, seen in roughly 1 of 5 runs of a
+single‑ensemble, strings‑off Collider run at √sₙₙ = 17.3 GeV on 8 threads. Results
+are unchanged.
+
 So: to reproduce a result bit‑for‑bit in the byte‑identical cases, just pin
 `OMP_NUM_THREADS`. In the FP‑chaotic cases, fix the thread count for determinism
 and check conserved quantities (helpers `verify/sumcons.py` / `verify/conserved.py`).
