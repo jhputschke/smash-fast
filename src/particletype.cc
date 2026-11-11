@@ -13,6 +13,9 @@
 
 #include <algorithm>
 #include <map>
+#include <mutex>
+#include <set>
+#include <shared_mutex>
 #include <vector>
 
 #include "smash/constants.h"
@@ -802,10 +805,24 @@ ParticleTypePtrList list_possible_resonances(const ParticleTypePtr type_a,
                                              const ParticleTypePtr type_b) {
   static std::map<std::set<ParticleTypePtr>, ParticleTypePtrList>
       map_possible_resonances_of;
+  /* The map is filled lazily, and this function is called concurrently from the
+   * parallel action finding (over cells or over ensembles). Look-ups therefore
+   * take a shared lock and the insertion of a new entry an exclusive one;
+   * without it, a thread inserting rebalances the tree under the readers. */
+  static std::shared_mutex map_mutex;
   std::set<ParticleTypePtr> incoming{type_a, type_b};
   const ParticleTypePtrList incoming_types = {type_a, type_b};
-  // Fill map if set is not yet present
-  if (map_possible_resonances_of.count(incoming) == 0) {
+  {
+    std::shared_lock<std::shared_mutex> lock(map_mutex);
+    const auto found = map_possible_resonances_of.find(incoming);
+    if (found != map_possible_resonances_of.end()) {
+      return found->second;
+    }
+  }
+  // Fill map if set is not yet present. The list is built outside the lock; if
+  // two threads race for the same pair they compute the same list and the
+  // second insertion below is a no-op.
+  {
     logg[LResonances].debug()
         << "Filling map of compatible resonances for ptypes " << type_a->name()
         << " " << type_b->name();
@@ -846,10 +863,10 @@ ParticleTypePtrList list_possible_resonances(const ParticleTypePtr type_a,
     }
     // Here `resonance_list` can be empty, corresponding to the case where there
     // are no possible resonances.
-    map_possible_resonances_of[incoming] = resonance_list;
+    std::unique_lock<std::shared_mutex> lock(map_mutex);
+    return map_possible_resonances_of.emplace(incoming, resonance_list)
+        .first->second;
   }
-
-  return map_possible_resonances_of[incoming];
 }
 
 }  // namespace smash

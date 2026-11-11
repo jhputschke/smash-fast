@@ -179,6 +179,10 @@ add_compiler_flags_if_supported("-fno-math-errno" # Tell the compiler to ignore 
                                                   # expressions.
                                 "-march=native" # The '-march=native' flag is not supported e.g. on
                                                 # Apple M1 machines
+                                "-Wno-psabi" # Silence the GCC note about the parameter-passing ABI
+                                             # change in GCC 10.1 for small aggregates passed by
+                                             # value (e.g. std::pair<double, double> in Key<...>).
+                                             # Benign for single-compiler builds.
                                 CXX_FLAGS CMAKE_CXX_FLAGS)
 
 # CMake provides 4 build configurations (Debug, Release, RelWithDebInfo, MinSizeRel) together with

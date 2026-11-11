@@ -171,6 +171,42 @@ class Grid : public GridBase {
    */
   double cell_volume() const { return cell_volume_; }
 
+  /// \return the number of cells in the grid
+  SizeType cell_count() const { return static_cast<SizeType>(cells_.size()); }
+
+  /**
+   * \param[in] i one-dimensional cell index
+   * \return whether the given cell contains no particles
+   */
+  bool cell_is_empty(SizeType i) const { return cells_[i].empty(); }
+
+  /**
+   * \param[in] search_cell_index one-dimensional cell index
+   * \return the number of times iterate_cells() calls the neighbor callback
+   *         for the given search cell (independent of the cell contents).
+   */
+  SizeType neighbor_task_count(SizeType search_cell_index) const;
+
+  /**
+   * The part of iterate_cells() that belongs to a single search cell: calls
+   * \p search_cell_callback once and \p neighbor_cell_callback for each of its
+   * 0 to 13 neighbor cells, in the same order and with the same (wrapped)
+   * particle positions as iterate_cells().
+   *
+   * Unlike iterate_cells() it only reads the grid, so different cells can be
+   * processed concurrently from different threads. The lists passed to the
+   * callbacks are only valid during the call.
+   *
+   * \param[in] search_cell_index one-dimensional index of the search cell
+   * \param[in] search_cell_callback see iterate_cells()
+   * \param[in] neighbor_cell_callback see iterate_cells()
+   */
+  void iterate_cell(
+      SizeType search_cell_index,
+      const std::function<void(const ParticleList &)> &search_cell_callback,
+      const std::function<void(const ParticleList &, const ParticleList &)>
+          &neighbor_cell_callback) const;
+
  private:
   /**
    * \return the one-dimensional cell-index from the 3-dim index \p x, \p y, \p
