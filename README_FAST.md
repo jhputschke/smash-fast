@@ -29,7 +29,7 @@ detail and transparency.
 |---|---|---|---|
 | **Ensembles** (no strings) | action *finding* + time‑stepless *performing* over independent ensembles | **3.3× (4t), 5.5–6.5× (8t)** | bit‑identical across thread counts |
 | **Strings** (Pythia, Collider) | **still the ensemble loop** (per‑thread Pythia/`StringProcess`, static schedule) — *not* a separate parallel path | **~2× (8t)** — but only with `Ensembles > 1` **and** strings that actually fire (high √s); otherwise **slower** (see below) | bit‑identical (moderate strings) / conserved to 1.7e‑10 (heavy strings) |
-| **Single big event** (`Ensembles: 1`) | cell‑parallel pair search in action finding | **3.9× (8t)** | bit‑identical across thread counts |
+| **Single big event** (`Ensembles: 1`) | cell‑parallel pair search in action finding — threads take whole search cells straight from the grid (no per‑task particle copies, RNG seeded only where a finder draws) | **3.9× (8t)** on `box_heavy`; on fine grids (many test particles) also **2–3.7× faster than the earlier cell‑parallel finder at every thread count** ([details](#finder-overhead-removed-fine-grids)) | bit‑identical across thread counts |
 | **Mean‑field / potentials** (CPU) | tabulated momentum‑dependent root‑find + node‑parallel *gather* density fill + node‑parallel force loops | **~2.4× (8t)** over the original momentum‑dependent baseline | validated by conservation (FP‑chaotic; see below) |
 | **GPU mean‑field step** (Metal/CUDA, *integrated*) | the **density fill** (Collider **and** Box) *and* the **force** — momentum‑dependent root‑find or the Skyrme/VDF field lookup — on the device | **5.0× (1t), 2.4× (8t)** for a collider momentum‑dependent run; **~2× mean‑field** for a box VDF run (gather‑bound) — vs the CPU at the same thread count (see below) | charge & Npart exact, energy to ~5e‑8 vs CPU |
 
@@ -226,7 +226,7 @@ Pythia 8.316; "evolution time" excludes the one‑time serial cache warm‑up):
 | **Many ensembles, `Strings: False`, collision/dilepton/photon/IC output** | parallel finding only (performing serial to keep output ordered) | ~2.7× (4t) | `input/stochastic_box` (stochastic criterion → finding only) |
 | **`Strings: True`, `Ensembles` ≥ threads, high √s** (strings actually fire) | per‑thread Pythia; parallel find **and** perform, static schedule (find‑thread = perform‑thread) | 1.35× (2t), ~2× (8t) | the **only** strings‑on case that speeds up; grows with #ensembles and string fraction. `verify/strings_collider.yaml` (O+O, √sₙₙ=17.3 GeV, 4 ens), `verify/strings_heavy.yaml` (Au+Au, 8 ens) |
 | **`Strings: True`, `Ensembles: 1`** *or* **low‑energy Collider** (strings never fire) | nothing parallelizes — one ensemble = no work to split, yet `OMP_NUM_THREADS` Pythia instances are still built; the strings flag also **disables** the cell‑parallel finder | **< 1× (slower than 1 thread)** | the common trap, e.g. Au+Au at `E_Kin: 1.23` GeV. Fix: set `Strings: False` (physically identical at that energy) and/or raise `Ensembles` — see callout below |
-| **`Ensembles: 1`, `Strings: False`, non‑stochastic criterion** | cell‑parallel pair search | 1.65× (2t), 2.66× (4t), 3.9× (8t) | `verify/box_heavy.yaml` with 1 ensemble |
+| **`Ensembles: 1`, `Strings: False`, non‑stochastic criterion** | cell‑parallel pair search | 1.65× (2t), 2.66× (4t), 3.9× (8t) | `verify/box_heavy.yaml` with 1 ensemble. With many test particles (fine grid, e.g. `verify/config_box_VDF.yaml`) the finder itself is now 2–3.7× cheaper, already at 1 thread — see [Finder overhead removed](#finder-overhead-removed-fine-grids) |
 | **`Potentials:` (mean field)** | tabulated root‑find (deterministic) + **gather density fill for ≥ 4 threads** + node‑parallel force loops | 1.13× (1t, tabulation only), 1.54× (4t), **2.43× (8t)** | `input/potentials`, `verify/potentials_nomd.yaml`, `verify/potentials_md.yaml` |
 | **`Potentials:` + GPU detected** (Collider, Covariant Gaussian, `Gpu: auto`) | density lattice fill **and** the force (momentum‑dependent root‑find, or the Skyrme/VDF field lookup) offloaded to **Metal/CUDA** | **5.0× (1t), 2.4× (8t)** over the CPU mean‑field path at the same thread count *(M3 Max)* | engages for any Covariant‑Gaussian potentials run; non‑potentials runs unaffected. `verify/potentials_md.yaml` |
 | **`Potentials:` + GPU, Box modus** (periodic lattice, VDF/Skyrme) | the **periodic** density gather on the device (cell‑list wrapped mod cell count, minimum‑image); the cheap field force is best kept on the CPU (`SMASH_GPU_FORCE=off`) | **~1.8–1.9× mean‑field** (1.79× 1t → 1.93× 16t); whole‑run **~1.1×** when 2→2 collisions are on (collision‑bound) *(M3 Max)* | new — lifts the old non‑periodic restriction. `verify/config_box_VDF.yaml` |
@@ -347,6 +347,13 @@ for ensembles) whenever collisions are a real fraction of the runtime.
 **barely scales** with threads. The cleanest way to see why is to write the hot run
 as *cold box + collisions* (best‑of‑2 `Time real`, M3 Max, CPU, `End_Time=10`):
 
+> **These numbers predate the finder rewrite** (and the cell‑list re‑search). Much
+> of the time booked as *finding* below was overhead of the cell‑parallel finder,
+> not pair search, and is gone now — see
+> [Finder overhead removed](#finder-overhead-removed-fine-grids) for current
+> numbers. The finding‑vs‑performing reasoning is unchanged, and performing is now
+> the largest term even at 1 thread.
+
 | component | 1t | 8t | 16t |
 |---|---|---|---|
 | **Cold box** — finding + mean‑field, 0 collisions (drop `Temperature` to 0.001) | 23.4 s | 9.2 s | 8.1 s |
@@ -389,6 +396,60 @@ search) is data‑parallel in principle, but SMASH's **cross‑section evaluatio
 that backs bit‑reproducibility — so a faithful port is a large project. In short
 the collision side is best left on the (already cell‑/ensemble‑parallel) CPU; the
 GPU win in this fork is the mean‑field gather.
+
+### Finder overhead removed (fine grids)
+
+Profiling `verify/config_box_VDF.yaml` showed that most of what was booked as
+*finding* was overhead in how the cell‑parallel finder handed out its work. With
+100 test particles the grid is fine — 31³ ≈ 30 000 cells holding about one particle
+each — and the finder turned every cell and every cell–neighbour pair into its own
+task, about 417 000 per timestep:
+
+- **Every task re‑seeded the thread's Mersenne Twister** (~0.3 µs, more than a
+  typical one‑particle neighbour search costs), although only the in‑cell search
+  ever draws a random number (the decay finder's decay times). This was about half
+  of the single‑thread time.
+- **The task list was built serially and carried copies of the particle lists**, so
+  every particle was copied ~28 times per timestep, with ~830 000 heap allocations.
+  This serial block is why extra threads barely helped.
+
+Now each thread takes whole search cells straight from the grid
+(`Grid::iterate_cell`) and walks the cell's neighbours in the same order as the
+serial iteration, with no copies; empty cells are skipped; and the RNG is seeded
+once per non‑empty cell, with the same seed index as before. The output is
+therefore **bit‑identical to the earlier implementation** at any thread count.
+
+`verify/config_box_VDF.yaml` as committed (`End_Time=5`), best‑of‑3 `Time real`,
+GB10:
+
+| | before | now | speedup |
+|---|---|---|---|
+| CPU, 1 thread | 12.72 s | **3.90 s** | 3.26× |
+| CPU, 4 threads | 8.30 s | **3.47 s** | 2.39× |
+| CPU, 8 threads | 7.17 s | **3.41 s** | 2.10× |
+| CPU, 20 threads | 6.73 s | **3.47 s** | 1.94× |
+| GPU, 1 thread | 12.14 s | **3.30 s** | 3.68× |
+| GPU, 8 threads | 6.69 s | **2.78 s** | 2.41× |
+| GPU, 20 threads | 6.50 s | **2.90 s** | 2.24× |
+
+The particle output is identical before and after in every row, and identical
+across the CPU thread counts. Coarse‑grid runs are unaffected: `box_heavy` with one
+ensemble and a single‑ensemble Collider run give the same times and identical
+output.
+
+**What is left.** Finding is now a small slice, so this run is *performing*‑bound
+and nearly flat in threads (3.9 s at 1 thread, 3.4 s at 8). In the 8‑thread GPU run
+about two thirds is the serial performing — advancing every particle to each
+collision time, and the Pauli‑blocking scan — about a tenth is building the grid
+and the re‑search cell list, and the GPU density gather is under a tenth.
+`Lazy_Propagation` removes the advance‑every‑particle term: **3.41 → 2.49 s** (CPU,
+8 threads) and **2.78 → 1.96 s** (GPU, 8 threads), at the price of not being
+bit‑identical (see above). Beyond that the lever is still `Ensembles`.
+
+> **`Time real` excludes startup.** The serial warm‑up of the resonance caches costs
+> about 16 s per process on this machine at any thread count, and a cold tabulation
+> cache (the first run that writes below a new output parent directory) adds about
+> 10 s. For a short run like this one, startup is longer than the evolution.
 
 ---
 

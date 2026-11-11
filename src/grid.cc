@@ -490,6 +490,172 @@ void Grid<GridOptions::PeriodicBoundaries>::iterate_cells(
   }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Per-cell iteration (iterate_cell / neighbor_task_count).
+//
+// These enumerate the neighbors of one search cell in exactly the order
+// iterate_cells() visits them, so that a caller looping over all cells
+// reproduces iterate_cells() callback for callback. The periodic variant also
+// reports the wrap vector iterate_cells() would have applied at that point;
+// iterate_cell() applies the same incremental translations to its copy of the
+// search cell, which keeps the wrapped positions bit-identical.
+
+/// Calls \p f(neighbor_cell_index) for every neighbor of cell \p idx.
+template <typename F>
+static void normal_neighbors(const std::array<int, 3> &nc, int idx, F &&f) {
+  const int x = idx % nc[0];
+  const int y = (idx / nc[0]) % nc[1];
+  const int z = idx / (nc[0] * nc[1]);
+  const auto &dz_list = z == nc[2] - 1 ? ZERO : ZERO_ONE;
+  const auto &dy_list = nc[1] == 1 ? ZERO
+                        : y == 0   ? ZERO_ONE
+                        : y == nc[1] - 1 ? MINUS_ONE_ZERO
+                                         : MINUS_ONE_ZERO_ONE;
+  const auto &dx_list = nc[0] == 1 ? ZERO
+                        : x == 0   ? ZERO_ONE
+                        : x == nc[0] - 1 ? MINUS_ONE_ZERO
+                                         : MINUS_ONE_ZERO_ONE;
+  for (int dz : dz_list) {
+    for (int dy : dy_list) {
+      for (int dx : dx_list) {
+        const int di = (dz * nc[1] + dy) * nc[0] + dx;
+        if (di > 0) {
+          f(idx + di);
+        }
+      }
+    }
+  }
+}
+
+/// Calls \p f(neighbor_cell_index, wrap_vector) for every neighbor of cell
+/// \p idx of a periodic grid.
+template <typename F>
+static void periodic_neighbors(const std::array<int, 3> &nc,
+                               const std::array<double, 3> &len, int idx,
+                               F &&f) {
+  const int x = idx % nc[0];
+  const int y = (idx / nc[0]) % nc[1];
+  const int z = idx / (nc[0] * nc[1]);
+  std::array<NeighborLookup, 2> dz_list;
+  std::array<NeighborLookup, 3> dy_list;
+  std::array<NeighborLookup, 3> dx_list;
+  dz_list[0].index = z;
+  dz_list[1].index = z + 1;
+  if (dz_list[1].index == nc[2]) {
+    dz_list[1].index = 0;
+    dz_list[1].wrap = NeedsToWrap::MinusLength;
+  }
+  dy_list[0].index = y;
+  dy_list[1].index = y - 1;
+  dy_list[2].index = y + 1;
+  if (y == 0) {
+    dy_list[1] = dy_list[2];
+    dy_list[2].index = nc[1] - 1;
+    dy_list[2].wrap = NeedsToWrap::PlusLength;
+  } else if (dy_list[2].index == nc[1]) {
+    dy_list[2].index = 0;
+    dy_list[2].wrap = NeedsToWrap::MinusLength;
+  }
+  dx_list[0].index = x;
+  dx_list[1].index = x - 1;
+  dx_list[2].index = x + 1;
+  if (x == 0) {
+    dx_list[1] = dx_list[2];
+    dx_list[2].index = nc[0] - 1;
+    dx_list[2].wrap = NeedsToWrap::PlusLength;
+  } else if (dx_list[2].index == nc[0]) {
+    dx_list[2].index = 0;
+    dx_list[2].wrap = NeedsToWrap::MinusLength;
+  }
+  auto mk = [&](int a, int b, int c) { return (c * nc[1] + b) * nc[0] + a; };
+  const std::array<int, 3> search_index = {x, y, z};
+  auto vsi = search_index;
+  ThreeVector wrap_vector = {};
+  for (const auto &dz : dz_list) {
+    if (dz.wrap == NeedsToWrap::MinusLength) {
+      wrap_vector[2] = -len[2];
+      vsi[2] = -1;
+    }
+    for (const auto &dy : dy_list) {
+      if (dy.wrap == NeedsToWrap::MinusLength) {
+        wrap_vector[1] = -len[1];
+        vsi[1] = -1;
+      } else if (dy.wrap == NeedsToWrap::PlusLength) {
+        wrap_vector[1] = len[1];
+        vsi[1] = nc[1];
+      }
+      for (const auto &dx : dx_list) {
+        if (dx.wrap == NeedsToWrap::MinusLength) {
+          wrap_vector[0] = -len[0];
+          vsi[0] = -1;
+        } else if (dx.wrap == NeedsToWrap::PlusLength) {
+          wrap_vector[0] = len[0];
+          vsi[0] = nc[0];
+        }
+        const int n = mk(dx.index, dy.index, dz.index);
+        if (n <= mk(vsi[0], vsi[1], vsi[2])) {
+          continue;
+        }
+        f(n, wrap_vector);
+      }
+      vsi[0] = search_index[0];
+      wrap_vector[0] = 0;
+    }
+    vsi[1] = search_index[1];
+    wrap_vector[1] = 0;
+  }
+}
+
+template <>
+GridBase::SizeType Grid<GridOptions::Normal>::neighbor_task_count(
+    SizeType idx) const {
+  SizeType n = 0;
+  normal_neighbors(number_of_cells_, idx, [&](int) { ++n; });
+  return n;
+}
+template <>
+GridBase::SizeType Grid<GridOptions::PeriodicBoundaries>::neighbor_task_count(
+    SizeType idx) const {
+  SizeType n = 0;
+  periodic_neighbors(number_of_cells_, length_, idx,
+                     [&](int, const ThreeVector &) { ++n; });
+  return n;
+}
+template <>
+void Grid<GridOptions::Normal>::iterate_cell(
+    SizeType idx,
+    const std::function<void(const ParticleList &)> &search_cell_callback,
+    const std::function<void(const ParticleList &, const ParticleList &)>
+        &neighbor_cell_callback) const {
+  const ParticleList &search = cells_[idx];
+  search_cell_callback(search);
+  normal_neighbors(number_of_cells_, idx,
+                   [&](int n) { neighbor_cell_callback(search, cells_[n]); });
+}
+template <>
+void Grid<GridOptions::PeriodicBoundaries>::iterate_cell(
+    SizeType idx,
+    const std::function<void(const ParticleList &)> &search_cell_callback,
+    const std::function<void(const ParticleList &, const ParticleList &)>
+        &neighbor_cell_callback) const {
+  // Working copy of the search cell (it gets translated when wrapping around
+  // the box). Thread-local so that its allocation is reused from cell to cell.
+  static thread_local ParticleList search;
+  search = cells_[idx];
+  search_cell_callback(search);
+  ThreeVector current_wrap_vector = {};
+  periodic_neighbors(number_of_cells_, length_, idx,
+                     [&](int n, const ThreeVector &wrap_vector) {
+                       if (wrap_vector != current_wrap_vector) {
+                         for_each(search, [&](ParticleData &p) {
+                           p = p.translated(wrap_vector - current_wrap_vector);
+                         });
+                         current_wrap_vector = wrap_vector;
+                       }
+                       neighbor_cell_callback(search, cells_[n]);
+                     });
+}
+
 template Grid<GridOptions::Normal>::Grid(
     const std::pair<std::array<double, 3>, std::array<double, 3>>
         &min_and_length,

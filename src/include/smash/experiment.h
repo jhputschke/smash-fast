@@ -338,9 +338,9 @@ class Experiment : public ExperimentBase {
    * threads, accumulating per-cell results and merging them in the serial
    * cell-iteration order. Used for the single-big-event regime where the
    * ensemble loop offers no parallelism. Restricted to the geometric/covariant
-   * criteria; the per-task deterministic seeding (see the body) makes the result
+   * criteria; the per-cell deterministic seeding (see the body) makes the result
    * bit-reproducible for any thread count, though not identical to the serial
-   * cell order (the decay-time RNG stream is re-keyed per task).
+   * cell order (the decay-time RNG stream is re-keyed per cell).
    *
    * \tparam G The grid type (normal or periodic boundaries).
    * \param[in] grid The spatial grid to search.
@@ -2917,57 +2917,80 @@ template <typename G>
 void Experiment<Modus>::find_actions_cell_parallel(const G &grid, double dt,
                                                    double gcell_vol,
                                                    Actions &out) {
-  /* A unit of work: the pair/multi-particle search within a search cell, or
-   * between a search cell and one neighbor cell. The particle lists are copied
-   * because the periodic-boundary grid hands the callbacks temporaries (with
-   * wrapped positions); the copies must outlive the parallel region below.
-   * Copying is O(particles-per-cell), negligible against the O(N^2) search. */
-  struct FindTask {
-    ParticleList search;
-    ParticleList neighbors;
-    bool is_neighbor;
-  };
-  std::vector<FindTask> tasks;
-  /* Collect the work items in the exact serial cell-iteration order, so the
-   * later merge reproduces the serial insertion order into the action heap. */
-  grid.iterate_cells(
-      [&](const ParticleList &search_list) {
-        tasks.push_back(FindTask{search_list, ParticleList{}, false});
-      },
-      [&](const ParticleList &search_list,
-          const ParticleList &neighbors_list) {
-        tasks.push_back(FindTask{search_list, neighbors_list, true});
-      });
-
-  /* Some finders draw random numbers during finding — notably the decay finder,
+  /* The unit of parallel work is a search cell: the pair/multi-particle search
+   * within the cell plus the searches between it and each of its neighbor
+   * cells. Grid::iterate_cell() hands these out for one cell in the same order
+   * (and, for the periodic grid, with the same wrapped positions) as the serial
+   * Grid::iterate_cells(), reading the grid only — so no per-task copies of the
+   * particle lists have to be collected serially up front. Empty search cells
+   * and empty neighbor cells cannot produce actions and are skipped.
+   *
+   * Some finders draw random numbers during finding — notably the decay finder,
    * which samples each resonance's decay time. To keep the result independent
    * of how the cells are distributed over threads, draw a single base seed from
-   * the ensemble's own stream and seed each task's RNG deterministically from
-   * (base_seed, task index). The ensemble engine (currently swapped into the
-   * thread-local engine by the caller's ScopedEngine) is thereby advanced by
-   * exactly one draw, keeping the subsequent performing phase deterministic.
-   * Worker threads re-seed their own thread-local engines per task, so we save
-   * and restore the ensemble state around the parallel region. */
+   * the ensemble's own stream and seed the RNG deterministically per cell. Only
+   * the in-cell search draws (the neighbor searches are restricted to the
+   * non-stochastic criteria here and the other finders ignore neighbors), so
+   * that is the only place the engine is seeded: seeding a Mersenne Twister is
+   * far more expensive than a typical neighbor search. The seed index is the
+   * position the in-cell search has in the flat serial sequence of callbacks
+   * (search cell, then its neighbors, cell after cell), which keeps the random
+   * streams — and hence the output — identical to enumerating every callback
+   * as its own task.
+   *
+   * The ensemble engine (currently swapped into the thread-local engine by the
+   * caller's ScopedEngine) is advanced by exactly one draw, keeping the
+   * subsequent performing phase deterministic. Worker threads re-seed their own
+   * thread-local engines, so we save and restore the ensemble state around the
+   * parallel region. */
+  const int ncell = grid.cell_count();
+  std::vector<uint64_t> task_base(ncell);
+  {
+    uint64_t t = 0;
+    for (int c = 0; c < ncell; c++) {
+      task_base[c] = t;
+      t += 1 + grid.neighbor_task_count(c);
+    }
+  }
   const uint64_t base_seed = random::advance();
   const random::Engine ensemble_state = random::get_engine_state();
 
-  std::vector<ActionList> results(tasks.size());
-#pragma omp parallel for schedule(dynamic)
-  for (size_t t = 0; t < tasks.size(); t++) {
-    const FindTask &task = tasks[t];
-    // Deterministic, order-independent RNG stream for this task.
-    random::set_seed(random::derive_seed(base_seed, t + 1));
-    ActionList &local = results[t];
-    for (const auto &finder : action_finders_) {
-      ActionList found =
-          task.is_neighbor
-              ? finder->find_actions_with_neighbors(task.search, task.neighbors,
-                                                    dt, beam_momentum_)
-              : finder->find_actions_in_cell(task.search, dt, gcell_vol,
-                                             beam_momentum_);
-      local.insert(local.end(), std::make_move_iterator(found.begin()),
-                   std::make_move_iterator(found.end()));
+  std::vector<ActionList> results(ncell);
+  /* Hand out several cells at a time on fine grids (many cheap, sparsely
+   * populated cells), but single cells on coarse grids, where one cell is a
+   * substantial amount of work. The result does not depend on the schedule. */
+#ifdef _OPENMP
+  const int chunk = std::clamp(ncell / (32 * omp_get_max_threads()), 1, 32);
+#endif
+#pragma omp parallel for schedule(dynamic, chunk)
+  for (int c = 0; c < ncell; c++) {
+    if (grid.cell_is_empty(c)) {
+      continue;
     }
+    ActionList &local = results[c];
+    grid.iterate_cell(
+        c,
+        [&](const ParticleList &search_list) {
+          random::set_seed(random::derive_seed(base_seed, task_base[c] + 1));
+          for (const auto &finder : action_finders_) {
+            ActionList found = finder->find_actions_in_cell(
+                search_list, dt, gcell_vol, beam_momentum_);
+            local.insert(local.end(), std::make_move_iterator(found.begin()),
+                         std::make_move_iterator(found.end()));
+          }
+        },
+        [&](const ParticleList &search_list,
+            const ParticleList &neighbors_list) {
+          if (neighbors_list.empty()) {
+            return;
+          }
+          for (const auto &finder : action_finders_) {
+            ActionList found = finder->find_actions_with_neighbors(
+                search_list, neighbors_list, dt, beam_momentum_);
+            local.insert(local.end(), std::make_move_iterator(found.begin()),
+                         std::make_move_iterator(found.end()));
+          }
+        });
   }
   // Restore the ensemble stream (the worker re-seeds clobbered the thread-local
   // engine); the caller's ScopedEngine then swaps this back into ensemble_rng_.
